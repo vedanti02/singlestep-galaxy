@@ -1,0 +1,65 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- Virtual environments -------------------------------------------------
+venv/
+.venv/
+env/
+.env
+.envrc
+
+# --- Build artifacts ------------------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Editors / IDEs -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Jupyter --------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# --- ML training artifacts (project-specific) -----------------------------
+runs/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.npz
+wandb/
+mlruns/
+
+# --- Eval / plotting outputs ----------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+
+# --- Local config overrides -----------------------------------------------
+config/local.yaml
+config/*.local.yaml
+
+# --- SLURM ----------------------------------------------------------------
+slurm-*.out
+*_train.log
+*_error.err

@@ -1,0 +1,47 @@
+# Direct-regression variant: skips flow-matching, predicts the residual
+# directly. Avoids the 1-step Euler noise floor that's been dominating
+# error in the FM-trained checkpoints.
+#
+# Algorithm (regions + d/2 buffer + outside conditioning) unchanged.
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+
+optim:
+  # batch_size doubled (4 -> 8) so lr scaled by sqrt(2) ~ 1.4 (mild scaling).
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: warmup_cosine
+  warmup_steps: 1000
+
+train:
+  epochs: 20
+  batch_size: 8
+  num_workers: 8
+  val_every: 2
+  ckpt_every: 2
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_direct
+
+flow:
+  mode: direct
+  lambda_voxel: 0.5

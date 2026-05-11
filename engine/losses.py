@@ -61,6 +61,41 @@ def masked_pt_mse(v_pred: torch.Tensor, v_target: torch.Tensor,
     return diff2.sum() / den
 
 
+def divergence_mse(disp_pred_vox: torch.Tensor,
+                   disp_true_vox: torch.Tensor,
+                   loss_mask: torch.Tensor) -> torch.Tensor:
+    """MSE on the divergence of a 3-component displacement field.
+
+    To first order in displacement, the density contrast is
+    :math:`\\delta = -\\nabla \\cdot \\boldsymbol{u}`. Matching the
+    divergence is therefore matching the linearized density. We use
+    central differences with periodic boundary conditions (torch.roll),
+    apply the inner-cube mask, and return mean squared error.
+
+    Args:
+        disp_pred_vox: ``(B, 3, D, D, D)`` predicted displacement field.
+        disp_true_vox: ``(B, 3, D, D, D)`` ground-truth displacement.
+        loss_mask:     ``(B, D, D, D)`` 0/1 inner-cube mask.
+
+    Returns:
+        Scalar tensor.
+    """
+    def _div(u):
+        ddx = (torch.roll(u[:, 0], -1, dims=1)
+               - torch.roll(u[:, 0],  1, dims=1)) * 0.5
+        ddy = (torch.roll(u[:, 1], -1, dims=2)
+               - torch.roll(u[:, 1],  1, dims=2)) * 0.5
+        ddz = (torch.roll(u[:, 2], -1, dims=3)
+               - torch.roll(u[:, 2],  1, dims=3)) * 0.5
+        return ddx + ddy + ddz                                       # (B, D, D, D)
+
+    div_pred = _div(disp_pred_vox)
+    div_true = _div(disp_true_vox)
+    diff2 = (div_pred - div_true) ** 2 * loss_mask
+    den = loss_mask.sum().clamp(min=1.0)
+    return diff2.sum() / den
+
+
 def voxel_consistency_mse(x1_pt_hat: torch.Tensor,
                           coords: torch.Tensor,
                           tgt_vox: torch.Tensor,

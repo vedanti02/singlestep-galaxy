@@ -1,0 +1,46 @@
+# LF-init flow matching: x_0 = LF disp (not noise), x_1 = HF.
+# v_target = HF - LF = residual (constant velocity along the path).
+# Avoids FM's noise floor while keeping FM's variable-t training signal.
+# Algorithm (regions + d/2 buffer + outside conditioning) unchanged.
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp, vel]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: warmup_cosine
+  warmup_steps: 1000
+
+train:
+  epochs: 12
+  batch_size: 4
+  num_workers: 8
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_lfinit
+
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5

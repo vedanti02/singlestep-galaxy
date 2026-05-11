@@ -1,0 +1,43 @@
+# Vel-input variant: adds LF velocity as a second 3-channel input field.
+# Algorithm (regions + d/2 buffer + outside conditioning) unchanged from default.
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp, vel]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+  # c_lf, c_lf_pt auto-derived from len(fields) * 3 in trainer
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+
+train:
+  epochs: 25
+  batch_size: 4
+  num_workers: 8
+  val_every: 1
+  ckpt_every: 5
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_vel
+
+flow:
+  n_steps_train: 1
+  n_steps_infer: 1
+  lambda_voxel: 0.5

@@ -13,7 +13,7 @@ class is portable across `.npy`/HDF5 layouts.
 from __future__ import annotations
 
 import os
-from typing import Optional, Sequence
+from typing import Optional, Sequence  # noqa: F401  (re-imported for clarity)
 
 import numpy as np
 import torch
@@ -168,7 +168,9 @@ class SimulationDataset(Dataset):
                  env_resolution: int = 64,
                  reader: Optional[TileReader] = None,
                  snapshot: str = SNAPSHOT_DEFAULT,
-                 seed: int = 0) -> None:
+                 seed: int = 0,
+                 fields: Optional[Sequence[str]] = None,
+                 extra_norms: Optional[dict] = None) -> None:
         if crop_overlap % 2 != 0 or not (0 < crop_overlap < crop_size):
             raise ValueError(
                 f"crop_overlap must be even and in (0, {crop_size}); "
@@ -184,6 +186,26 @@ class SimulationDataset(Dataset):
         self.env_resolution = env_resolution
         self.reader = reader or get_reader("numpy")
         self.snapshot = snapshot
+        # Multi-field LF inputs. The first field is always "disp" (used
+        # for the residual target). Extra fields ("vel") are concatenated
+        # into lf_voxel and lf_pt as additional channels, normalized with
+        # extra_norms[field]. The target stays disp-only.
+        self.fields = list(fields) if fields else ["disp"]
+        if self.fields[0] != "disp":
+            raise ValueError(f"fields[0] must be 'disp'; got {self.fields}")
+        self.extra_norms = extra_norms or {}
+        for f in self.fields[1:]:
+            if f not in self.extra_norms:
+                raise ValueError(
+                    f"missing norm stats for extra field '{f}'; "
+                    f"got extra_norms keys={list(self.extra_norms)}"
+                )
+        # Cube-reflection augmentation flag. When True, each crop is
+        # randomly reflected along each spatial axis (8 combinations).
+        # Each spatial flip negates the corresponding vector component
+        # in disp/vel channels; the env indicator channel is invariant.
+        self.augment = False
+        self._aug_rng = np.random.default_rng(seed)
 
         self.hf_root = os.path.join(root, "quijote-64")
         self.lf_root = os.path.join(root, "quijotelike-64")
@@ -229,12 +251,27 @@ class SimulationDataset(Dataset):
         D = self.D
 
         lf = self.reader.load_crop(self.lf_root, sid, (sx, sy, sz),
-                                   D, ext_vox, self.snapshot)
+                                   D, ext_vox, self.snapshot, field="disp")
         hf = self.reader.load_crop(self.hf_root, sid, (sx, sy, sz),
-                                   D, ext_vox, self.snapshot)
+                                   D, ext_vox, self.snapshot, field="disp")
         lf_n = self.norm.normalize(lf).astype(np.float32)
         hf_n = self.norm.normalize(hf).astype(np.float32)
         residual = (hf_n - lf_n).astype(np.float32)
+
+        # Optional additional LF input channels (e.g. velocity). Loaded
+        # from the same set/crop, normalized per-field, and concatenated
+        # along the channel axis. Target stays disp-only.
+        extra_lf_n = []
+        for f in self.fields[1:]:
+            extra = self.reader.load_crop(self.lf_root, sid, (sx, sy, sz),
+                                          D, ext_vox, self.snapshot, field=f)
+            extra_lf_n.append(
+                self.extra_norms[f].normalize(extra).astype(np.float32)
+            )
+        if extra_lf_n:
+            lf_full = np.concatenate([lf_n] + extra_lf_n, axis=0)            # (3*F, D, D, D)
+        else:
+            lf_full = lf_n
 
         env_path = os.path.join(self.st_root, f"set{sid}_quijotelike",
                                 self.snapshot, "disp.npy")
@@ -246,13 +283,36 @@ class SimulationDataset(Dataset):
                                   self.snapshot, "style.npy")
         style = self.reader.load_full(style_path).astype(np.float32)
 
+        # Optional cube-reflection augmentation (8 combinations).
+        # Spatial flip on axis i ↔ negate component i of every 3-vector
+        # field. The env indicator channel (index 3) is invariant.
+        if self.augment:
+            signs = self._aug_rng.choice([-1, 1], size=3)
+            for i, s in enumerate(signs):
+                if s < 0:
+                    lf_full = np.flip(lf_full, axis=i + 1)
+                    residual = np.flip(residual, axis=i + 1)
+                    env_n = np.flip(env_n, axis=i + 1)
+                    # Negate component i of every 3-vector in each field.
+                    for chan_offset in range(0, lf_full.shape[0], 3):
+                        lf_full[chan_offset + i] = -lf_full[chan_offset + i]
+                    residual[i] = -residual[i]
+                    # Env: first 3 channels are vector components; trailing
+                    # indicator channel (if present) does not negate.
+                    for c in range(min(3, env_n.shape[0])):
+                        if c == i:
+                            env_n[c] = -env_n[c]
+            lf_full = np.ascontiguousarray(lf_full)
+            residual = np.ascontiguousarray(residual)
+            env_n = np.ascontiguousarray(env_n)
+
         # all D³ Lagrangian cells as points (no subsampling)
         i0, i1, i2 = self._cell_idx[:, 0], self._cell_idx[:, 1], self._cell_idx[:, 2]
-        lf_pt  = lf_n[:, i0, i1, i2].T.astype(np.float32)                 # (D³, 3)
+        lf_pt  = lf_full[:, i0, i1, i2].T.astype(np.float32)              # (D³, 3*F)
         tgt_pt = residual[:, i0, i1, i2].T.astype(np.float32)             # (D³, 3)
 
         return {
-            "lf_voxel": torch.from_numpy(lf_n),
+            "lf_voxel": torch.from_numpy(lf_full),
             "env":      torch.from_numpy(env_n),
             "coords":   torch.from_numpy(self._cell_coords),
             "lf_pt":    torch.from_numpy(lf_pt),

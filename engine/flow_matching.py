@@ -43,6 +43,55 @@ def fm_targets(x1: torch.Tensor, t: torch.Tensor
 
 
 @torch.no_grad()
+def direct_sample(model: PVFlowMatcher,
+                  lf_voxel: torch.Tensor,
+                  env: torch.Tensor,
+                  style: torch.Tensor,
+                  coords: torch.Tensor,
+                  lf_pt: torch.Tensor) -> torch.Tensor:
+    """One forward pass for the direct-regression variant.
+
+    Used when cfg.flow.mode == "direct": the model is trained to predict
+    the residual directly (no Euler integration). x_t is fed random noise
+    (matching the training distribution) and t = 0.
+    """
+    B, N, _ = coords.shape
+    t = torch.zeros(B, device=coords.device, dtype=coords.dtype)
+    x_t = torch.randn(B, N, model.c_pt,
+                      device=coords.device, dtype=coords.dtype)
+    lf_feat, cond = model.encode_cond(lf_voxel, env, style, t)
+    return model(x_t, coords, lf_pt, lf_feat, cond)
+
+
+@torch.no_grad()
+def lf_init_sample(model: PVFlowMatcher,
+                   lf_voxel: torch.Tensor,
+                   env: torch.Tensor,
+                   style: torch.Tensor,
+                   coords: torch.Tensor,
+                   lf_pt: torch.Tensor,
+                   steps: int = 1) -> torch.Tensor:
+    """Inference for cfg.flow.mode == "lf_init".
+
+    The model was trained with x_0 = LF disp, x_1 = HF, so the analytic
+    velocity along the path is constant = HF - LF = residual. At
+    inference we start at x = LF (no random noise) and integrate to
+    estimate x_1 = HF. Returns the predicted RESIDUAL (HF - LF), matching
+    the convention of the FM and direct samplers.
+    """
+    B, N, _ = coords.shape
+    lf_disp_pt = lf_pt[..., :3]                         # (B, N, 3)
+    x = lf_disp_pt.clone()
+    dt = 1.0 / steps
+    for k in range(steps):
+        t = torch.full((B,), k * dt, device=coords.device, dtype=coords.dtype)
+        lf_feat, cond = model.encode_cond(lf_voxel, env, style, t)
+        v = model(x, coords, lf_pt, lf_feat, cond)
+        x = x + dt * v
+    return x - lf_disp_pt                               # predicted residual
+
+
+@torch.no_grad()
 def euler_sample(model: PVFlowMatcher,
                  lf_voxel: torch.Tensor,
                  env: torch.Tensor,

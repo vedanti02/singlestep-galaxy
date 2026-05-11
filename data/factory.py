@@ -22,6 +22,28 @@ def _stitched_lf_paths(root: str, sets, snapshot: str) -> list[str]:
             for sid, _ in sets]
 
 
+def _quijotelike_field_paths(root: str, sets, snapshot: str,
+                             field: str) -> list[str]:
+    """Per-set tile paths for an arbitrary field (e.g. 'vel').
+
+    Falls back to the (1,1,1) tile when only one is present, otherwise
+    enumerates all tiles for the set's extent so norm stats are
+    computed on a representative spatial sample.
+    """
+    paths: list[str] = []
+    for sid, ext in sets:
+        ex, ey, ez = ext
+        for ix in range(ex):
+            for iy in range(ey):
+                for iz in range(ez):
+                    paths.append(os.path.join(
+                        root, "quijotelike-64",
+                        f"set{sid}_pos_{ix}_{iy}_{iz}",
+                        snapshot, f"{field}.npy"
+                    ))
+    return paths
+
+
 def build_norm_stats(cfg: Config, reader: TileReader) -> NormStats:
     """Compute norm stats from the *training* split of the configured root."""
     snapshot = cfg["data"].get("snapshot", SNAPSHOT_DEFAULT)
@@ -33,14 +55,16 @@ def build_norm_stats(cfg: Config, reader: TileReader) -> NormStats:
 
 def build_datasets(cfg: Config,
                    reader: Optional[TileReader] = None,
-                   norm: Optional[NormStats] = None
-                   ) -> tuple[dict[str, SimulationDataset], NormStats]:
+                   norm: Optional[NormStats] = None,
+                   extra_norms: Optional[dict] = None,
+                   ) -> tuple[dict[str, SimulationDataset], NormStats, dict]:
     """Build {'train','val','test'} datasets from a Config.
 
     Returns:
-        Tuple ``(datasets, norm)``. ``datasets`` is a dict keyed by split
-        name; missing splits map to empty dicts (some configurations
-        have an empty test split).
+        Tuple ``(datasets, norm, extra_norms)``. ``datasets`` is a dict
+        keyed by split name; missing splits map to empty dicts.
+        ``extra_norms`` is a dict ``{field: NormStats}`` for any extra
+        LF input fields beyond "disp" (empty if cfg.data.fields == ["disp"]).
     """
     reader = reader or get_reader(cfg["data"].get("reader", "numpy"))
     snapshot = cfg["data"].get("snapshot", SNAPSHOT_DEFAULT)
@@ -51,11 +75,23 @@ def build_datasets(cfg: Config,
         train_paths = _stitched_lf_paths(cfg["data"]["root"], splits["train"], snapshot)
         norm = compute_norm_stats(train_paths, max_files=16)
 
+    fields = list(cfg["data"].get("fields", ["disp"]))
+    if fields[0] != "disp":
+        raise ValueError(f"cfg.data.fields[0] must be 'disp'; got {fields}")
+    if extra_norms is None:
+        extra_norms = {}
+        for f in fields[1:]:
+            paths = _quijotelike_field_paths(
+                cfg["data"]["root"], splits["train"], snapshot, f)
+            extra_norms[f] = compute_norm_stats(paths, max_files=16)
+
+    aug = bool(cfg["data"].get("augment", False))
+
     out: dict[str, SimulationDataset] = {}
     for name, set_list in splits.items():
         if not set_list:
             continue
-        out[name] = SimulationDataset(
+        ds = SimulationDataset(
             root=cfg["data"]["root"],
             sets=set_list,
             crop_size=cfg["data"]["crop_size"],
@@ -66,8 +102,13 @@ def build_datasets(cfg: Config,
             reader=reader,
             snapshot=snapshot,
             seed=cfg["train"].get("seed", 0) + (0 if name == "train" else 1),
+            fields=fields,
+            extra_norms=extra_norms,
         )
-    return out, norm
+        # Only augment the train split — val/test must stay deterministic.
+        ds.augment = aug and (name == "train")
+        out[name] = ds
+    return out, norm, extra_norms
 
 
 def build_dataloaders(cfg: Config,

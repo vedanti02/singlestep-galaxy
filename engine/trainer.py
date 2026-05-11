@@ -18,7 +18,8 @@ from models import PVFlowMatcher
 from .checkpoint import CheckpointManager
 from .ema import ModelEMA
 from .flow_matching import fm_targets
-from .losses import masked_pt_mse, voxel_consistency_mse
+from .losses import divergence_mse, masked_pt_mse, voxel_consistency_mse
+from ops.geometry import points_to_voxel
 
 
 def _set_seed(seed: int) -> None:
@@ -31,8 +32,11 @@ def _build_model(cfg: Config) -> PVFlowMatcher:
     # If env_outside_mask is on the env carries an extra indicator channel,
     # so c_env defaults to 4. The user can override via cfg["model"]["c_env"].
     default_c_env = 4 if cfg["data"].get("env_outside_mask", True) else 3
+    n_fields = len(cfg["data"].get("fields", ["disp"]))
+    c_lf = m.get("c_lf", 3 * n_fields)
+    c_lf_pt = m.get("c_lf_pt", 3 * n_fields)
     return PVFlowMatcher(
-        c_pt=3, c_lf=3, c_env=m.get("c_env", default_c_env), c_lf_pt=3,
+        c_pt=3, c_lf=c_lf, c_env=m.get("c_env", default_c_env), c_lf_pt=c_lf_pt,
         n_style=m.get("n_style", 5),
         base_voxel=m.get("base_voxel", 32),
         base_point=m.get("base_point", 128),
@@ -60,7 +64,8 @@ class Trainer:
 
         # data
         reader = get_reader(cfg["data"].get("reader", "numpy"))
-        self.datasets, self.norm = build_datasets(cfg, reader=reader, norm=norm)
+        self.datasets, self.norm, self.extra_norms = build_datasets(
+            cfg, reader=reader, norm=norm)
         self.loaders: dict[str, DataLoader] = build_dataloaders(cfg, self.datasets)
 
         # model
@@ -74,7 +79,34 @@ class Trainer:
             lr=cfg["optim"]["lr"],
             weight_decay=cfg["optim"].get("weight_decay", 1e-5),
         )
-        self.scaler = torch.amp.GradScaler(
+        # Optional LR schedule: linear warmup then cosine decay.
+        # Enable with cfg.optim.lr_schedule = "warmup_cosine".
+        # cfg.optim.warmup_steps controls warmup length (default 500).
+        sched_name = cfg["optim"].get("lr_schedule", "constant")
+        if sched_name == "warmup_cosine":
+            warmup = int(cfg["optim"].get("warmup_steps", 500))
+            steps_per_epoch = max(1, len(self.datasets["train"]) //
+                                  cfg["train"]["batch_size"])
+            total_steps = max(1, steps_per_epoch * cfg["train"]["epochs"])
+
+            def _lr_lambda(step: int) -> float:
+                if step < warmup:
+                    return float(step + 1) / float(warmup)
+                # cosine from 1.0 to 0.0 over the remaining steps
+                progress = (step - warmup) / max(1, total_steps - warmup)
+                progress = min(max(progress, 0.0), 1.0)
+                import math
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            self.lr_sched = torch.optim.lr_scheduler.LambdaLR(
+                self.opt, lr_lambda=_lr_lambda)
+            self._global_step = 0
+        else:
+            self.lr_sched = None
+            self._global_step = 0
+        # torch.cuda.amp.* is available since 1.6; the newer torch.amp.*
+        # API only exists in 2.5+, so use the legacy path for portability.
+        self.scaler = torch.cuda.amp.GradScaler(
             enabled=str(self.device).startswith("cuda"))
 
         # bookkeeping
@@ -102,23 +134,82 @@ class Trainer:
         style     = batch["style"].to(d)
 
         B = lf_voxel.shape[0]
-        t = torch.rand(B, device=d)
-        x_t, v_target = fm_targets(tgt_pt, t)
+        mode = cfg["flow"].get("mode", "flow_matching")
 
-        lf_feat, cond = self.model.encode_cond(lf_voxel, env, style, t)
-        v_pred = self.model(x_t, coords, lf_pt, lf_feat, cond)
-
-        pt_loss = masked_pt_mse(v_pred, v_target, pt_mask)
-
-        # x1 estimate from interpolant + velocity
-        x1_hat = x_t + (1.0 - t.view(-1, 1, 1)) * v_pred
-        vox_loss = voxel_consistency_mse(x1_hat, coords, tgt_vox, loss_mask)
+        if mode == "direct":
+            # Direct residual regression: model predicts tgt_pt itself.
+            # x_t is fed random noise (not the placeholder zero) so the
+            # model is forced to use the conditioning rather than fitting
+            # a fixed input pattern. t stays 0.
+            t = torch.zeros(B, device=d)
+            x_t = torch.randn_like(tgt_pt)
+            lf_feat, cond = self.model.encode_cond(lf_voxel, env, style, t)
+            x1_pred = self.model(x_t, coords, lf_pt, lf_feat, cond)
+            pt_loss = masked_pt_mse(x1_pred, tgt_pt, pt_mask)
+            # In direct mode each cell has exactly one point, so the
+            # voxel-scatter is the identity — vox_loss == pt_loss and
+            # adding it just doubles the gradient. Skip it.
+            vox_loss = torch.zeros((), device=d)
+        elif mode == "lf_init":
+            # LF-init flow matching: x_0 = LF disp (in normalized space),
+            # x_1 = HF = LF + tgt_pt. The interpolant x_t = (1-t)*LF + t*HF
+            # always lives in the data manifold (no random noise floor).
+            # The analytic velocity is constant: v* = HF - LF = tgt_pt.
+            t = torch.rand(B, device=d)
+            lf_disp_pt = lf_pt[..., :3]               # disp channels only
+            x_1 = lf_disp_pt + tgt_pt                  # HF (normalized)
+            t_ = t.view(-1, 1, 1)
+            x_t = (1.0 - t_) * lf_disp_pt + t_ * x_1
+            v_target = tgt_pt                          # constant velocity
+            lf_feat, cond = self.model.encode_cond(lf_voxel, env, style, t)
+            v_pred = self.model(x_t, coords, lf_pt, lf_feat, cond)
+            pt_loss = masked_pt_mse(v_pred, v_target, pt_mask)
+            # Predicted residual at points (x_1 estimate minus LF) and
+            # apply voxel-consistency on it against the residual cube.
+            x1_hat = x_t + (1.0 - t_) * v_pred
+            residual_pt_hat = x1_hat - lf_disp_pt
+            vox_loss = voxel_consistency_mse(residual_pt_hat, coords,
+                                             tgt_vox, loss_mask)
+        else:
+            t = torch.rand(B, device=d)
+            x_t, v_target = fm_targets(tgt_pt, t)
+            lf_feat, cond = self.model.encode_cond(lf_voxel, env, style, t)
+            v_pred = self.model(x_t, coords, lf_pt, lf_feat, cond)
+            pt_loss = masked_pt_mse(v_pred, v_target, pt_mask)
+            # x1 estimate from interpolant + velocity
+            x1_hat = x_t + (1.0 - t.view(-1, 1, 1)) * v_pred
+            vox_loss = voxel_consistency_mse(x1_hat, coords, tgt_vox, loss_mask)
 
         lam = cfg["flow"].get("lambda_voxel", 0.5)
-        loss = pt_loss + lam * vox_loss
+        lam_div = cfg["flow"].get("lambda_div", 0.0)
+
+        # Auxiliary divergence loss matches first-order density via
+        # delta ≈ -∇·u. Needs the predicted residual scattered to the
+        # crop's voxel grid; we reuse the points_to_voxel rasterizer.
+        div_loss = torch.zeros((), device=d)
+        if lam_div > 0:
+            # Predicted residual at points depends on mode:
+            #   FM:       residual ≈ v_pred * (1 - 0) at t=0 inference, but
+            #             we approximate using x1_hat - x_t at training t.
+            #             Use voxel-form: scatter x1_hat to grid, subtract LF disp cube.
+            #   direct:   x1_pred is the residual itself.
+            #   lf_init:  v_pred is the residual (constant velocity = tgt).
+            if mode == "direct":
+                pred_pt = x1_pred
+            elif mode == "lf_init":
+                pred_pt = v_pred
+            else:
+                # x1_hat - x_t = (1-t)*v_pred (approximation of residual)
+                pred_pt = (1.0 - t.view(-1, 1, 1)) * v_pred
+            D_ = tgt_vox.shape[-1]
+            pred_vox = points_to_voxel(coords, pred_pt, R=D_, reduction="mean")
+            div_loss = divergence_mse(pred_vox, tgt_vox, loss_mask)
+
+        loss = pt_loss + lam * vox_loss + lam_div * div_loss
         return {"loss": loss,
                 "pt_loss": pt_loss.detach(),
-                "vox_loss": vox_loss.detach()}
+                "vox_loss": vox_loss.detach(),
+                "div_loss": div_loss.detach()}
 
     # ------------------------------------------------------------------
     # epochs
@@ -133,15 +224,18 @@ class Trainer:
 
         for step, batch in enumerate(self.loaders["train"]):
             self.opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(
-                    device_type=str(self.device).split(":")[0],
+            with torch.cuda.amp.autocast(
                     enabled=str(self.device).startswith("cuda")):
                 losses = self._step(batch)
             self.scaler.scale(losses["loss"]).backward()
             self.scaler.unscale_(self.opt)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), clip)
             self.scaler.step(self.opt)
             self.scaler.update()
+            if self.lr_sched is not None:
+                self.lr_sched.step()
+            self._global_step += 1
             self.ema.update(self.model)
 
             running["loss"]    += float(losses["loss"]) * bs
@@ -149,10 +243,13 @@ class Trainer:
             running["vox_loss"]+= float(losses["vox_loss"]) * bs
             running["n"]       += bs
             if step % 20 == 0:
+                lr_now = self.opt.param_groups[0]["lr"]
                 print(f"  e{epoch:03d} step {step:05d}  "
                       f"loss={float(losses['loss']):.4f} "
                       f"pt={float(losses['pt_loss']):.4f} "
-                      f"vox={float(losses['vox_loss']):.4f}")
+                      f"vox={float(losses['vox_loss']):.4f} "
+                      f"|g|={float(grad_norm):.3f} "
+                      f"lr={lr_now:.2e}")
 
         n = max(running["n"], 1)
         out = {k: v / n for k, v in running.items() if k != "n"}
@@ -204,7 +301,8 @@ class Trainer:
                 self.ckpt.save(epoch=epoch, model=self.model,
                                optim=self.opt, norm=self.norm,
                                cfg=cfg, ema_state=self.ema.shadow_state_dict(),
-                               tag=f"epoch{epoch:03d}")
+                               tag=f"epoch{epoch:03d}",
+                               extra_norms=self.extra_norms)
 
             with open(self.out_dir / "log.json", "w") as f:
                 json.dump(self.history, f, indent=2)

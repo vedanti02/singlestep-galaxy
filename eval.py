@@ -42,8 +42,11 @@ def main() -> None:
 
     m = cfg["model"]
     default_c_env = 4 if cfg["data"].get("env_outside_mask", True) else 3
+    n_fields = len(cfg["data"].get("fields", ["disp"]))
+    c_lf = m.get("c_lf", 3 * n_fields)
+    c_lf_pt = m.get("c_lf_pt", 3 * n_fields)
     model = PVFlowMatcher(
-        c_pt=3, c_lf=3, c_env=m.get("c_env", default_c_env), c_lf_pt=3,
+        c_pt=3, c_lf=c_lf, c_env=m.get("c_env", default_c_env), c_lf_pt=c_lf_pt,
         n_style=m.get("n_style", 5),
         base_voxel=m.get("base_voxel", 32),
         base_point=m.get("base_point", 128),

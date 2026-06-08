@@ -75,6 +75,12 @@ class PointVoxelEncoder(nn.Module):
         c_v = self.lf_unet.out_channels                          # voxel feat dim
 
         # input concat: x_t ⊕ coords ⊕ LF_pt ⊕ voxel_feat_at_pt
+        # When c_lf_pt == 0, drop the raw LF skip — the model only sees LF
+        # via the U-Net voxel features. This avoids the (x_t, lf_pt) shortcut
+        # in lf_init mode where x_t = (1-t)*lf + t*hf and the trivial
+        # solution v = (x_t - lf_pt)/t collapses training loss without
+        # forcing the model to learn the conditioning-only inference path.
+        self.c_lf_pt = c_lf_pt
         c_in = c_pt + 3 + c_lf_pt + c_v
         self.in_proj = nn.Conv1d(c_in, base_point, 1)
 
@@ -103,12 +109,14 @@ class PointVoxelEncoder(nn.Module):
                 lf_feat: torch.Tensor,
                 cond: torch.Tensor) -> torch.Tensor:
         v_at_pt = trilinear_devoxelize(lf_feat, coords)            # (B, c_v, N)
-        feat = torch.cat([
+        parts = [
             x_t.transpose(1, 2),                                   # (B, c_pt, N)
             coords.transpose(1, 2),                                # (B, 3, N)
-            lf_pt.transpose(1, 2),                                 # (B, c_lf_pt, N)
-            v_at_pt,                                               # (B, c_v, N)
-        ], dim=1)
+        ]
+        if self.c_lf_pt > 0:
+            parts.append(lf_pt.transpose(1, 2))                    # (B, c_lf_pt, N)
+        parts.append(v_at_pt)                                      # (B, c_v, N)
+        feat = torch.cat(parts, dim=1)
         h = self.in_proj(feat)
         for i, blk in enumerate(self.trunk):
             h = blk(h, cond)

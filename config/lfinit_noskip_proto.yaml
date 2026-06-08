@@ -1,0 +1,59 @@
+# Fast-prototype variant of lfinit_noskip.yaml.
+# Purpose: validate the architectural fix (drop lf_pt skip + noise on x_t)
+# in 1-2 hours on contended storage, rather than waiting 8+ days for a
+# full 20-epoch run.
+#
+# Differences vs lfinit_noskip.yaml:
+#   - fields: [disp] only (drop vel) -> halves per-sample file reads
+#   - train.max_train_crops: 25000   -> ~6250 steps/epoch instead of ~56k
+#   - train.epochs: 8                -> more checkpoints in the same wall time
+#   - num_workers: 4                 -> less contention with neighbours
+#
+# After this validates rel_to_zero < 1.0 in the inner cube, the full run
+# uses lfinit_noskip.yaml.
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+  c_lf_pt: 0          # the architectural fix: no raw LF skip on the trunk
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: warmup_cosine
+  warmup_steps: 500
+
+train:
+  epochs: 8
+  batch_size: 4
+  num_workers: 4
+  prefetch_factor: 4
+  max_train_crops: 25000    # ~6250 steps/epoch
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_noskip_proto
+
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5
+  noise_sigma: 0.2

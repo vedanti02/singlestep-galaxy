@@ -39,6 +39,8 @@ def main() -> None:
     payload = CheckpointManager.load(args.ckpt, map_location=args.device)
     cfg = payload["cfg"]
     norm = NormStats.from_dict(payload["norm"])
+    extra_norms = {k: NormStats.from_dict(v)
+                   for k, v in (payload.get("extra_norms") or {}).items()}
 
     m = cfg["model"]
     default_c_env = 4 if cfg["data"].get("env_outside_mask", True) else 3
@@ -64,7 +66,8 @@ def main() -> None:
 
     out_dir = args.out_dir or str(Path(args.ckpt).parent / "eval")
     ev = Evaluator(model=model, cfg=cfg, norm=norm, out_dir=out_dir,
-                   steps=args.steps, chunk_pts=args.chunk_pts)
+                   steps=args.steps, chunk_pts=args.chunk_pts,
+                   extra_norms=extra_norms)
     ev.run(max_sets=args.max_sets, save_arrays=args.save_arrays)
 
 

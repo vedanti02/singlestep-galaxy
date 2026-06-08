@@ -155,11 +155,35 @@ class Trainer:
             # x_1 = HF = LF + tgt_pt. The interpolant x_t = (1-t)*LF + t*HF
             # always lives in the data manifold (no random noise floor).
             # The analytic velocity is constant: v* = HF - LF = tgt_pt.
-            t = torch.rand(B, device=d)
+            # Optional t-bias: when t_alpha > 0, sample t ~ Beta(t_alpha, 1)
+            # which biases toward small t. Inference uses t=0, and the model
+            # cannot exploit the v = (x_t - lf_pt)/t shortcut at small t,
+            # so this trains the conditioning-only path more thoroughly.
+            t_alpha = cfg["flow"].get("t_alpha", 0.0)
+            p_zero  = cfg["flow"].get("p_zero", 0.0)
+            noise_sigma = cfg["flow"].get("noise_sigma", 0.0)
+            if t_alpha > 0:
+                u = torch.rand(B, device=d).clamp(min=1e-6)
+                t = u.pow(1.0 / t_alpha)               # ~ Beta(t_alpha, 1)
+            else:
+                t = torch.rand(B, device=d)
+            if p_zero > 0:
+                # Force t=0 on a fraction of the batch — the model literally
+                # trains on the inference distribution.
+                t = torch.where(torch.rand(B, device=d) < p_zero,
+                                torch.zeros_like(t), t)
             lf_disp_pt = lf_pt[..., :3]               # disp channels only
             x_1 = lf_disp_pt + tgt_pt                  # HF (normalized)
             t_ = t.view(-1, 1, 1)
             x_t = (1.0 - t_) * lf_disp_pt + t_ * x_1
+            if noise_sigma > 0:
+                # Inject Gaussian noise on x_t scaled by sqrt(t*(1-t)).
+                # Vanishes at endpoints (so x_0=lf, x_1=hf are unchanged
+                # in expectation), peaks in the middle. Breaks the
+                # (x_t - lf_pt)/t shortcut without changing the optimal
+                # constant velocity v* = HF - LF.
+                scale = noise_sigma * torch.sqrt(t_ * (1.0 - t_) + 1e-8)
+                x_t = x_t + scale * torch.randn_like(x_t)
             v_target = tgt_pt                          # constant velocity
             lf_feat, cond = self.model.encode_cond(lf_voxel, env, style, t)
             v_pred = self.model(x_t, coords, lf_pt, lf_feat, cond)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 
 from config import Config
 
@@ -120,14 +120,32 @@ def build_dataloaders(cfg: Config,
     pin = cfg["train"].get("device", "cpu").startswith("cuda")
     collate = PatchCollator()
 
+    # persistent_workers keeps the per-worker env/style caches warm across
+    # epochs and avoids the per-epoch worker spawn cost. prefetch_factor>2
+    # hides per-sample I/O latency on networked storage.
+    prefetch = cfg["train"].get("prefetch_factor", 4)
+    # Optional fast-prototype knob: subsample the train epoch to N random
+    # crops (with replacement) instead of iterating all ~224k. Useful for
+    # quickly validating an arch change without paying for a full epoch
+    # on contended storage.
+    max_train = int(cfg["train"].get("max_train_crops", 0) or 0)
     loaders: dict[str, DataLoader] = {}
     for name, ds in datasets.items():
-        loaders[name] = DataLoader(
-            ds, batch_size=bs,
-            shuffle=(name == "train"),
+        kw = dict(
+            batch_size=bs,
             num_workers=nw,
             pin_memory=pin,
             collate_fn=collate,
             drop_last=(name == "train"),
         )
+        if name == "train" and max_train > 0 and max_train < len(ds):
+            # RandomSampler with replacement + num_samples caps the epoch
+            kw["sampler"] = RandomSampler(ds, replacement=True,
+                                          num_samples=max_train)
+        else:
+            kw["shuffle"] = (name == "train")
+        if nw > 0:
+            kw["persistent_workers"] = True
+            kw["prefetch_factor"] = prefetch
+        loaders[name] = DataLoader(ds, **kw)
     return loaders

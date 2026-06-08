@@ -1,0 +1,53 @@
+# Fine-tune v2: isolate the divergence loss contribution.
+#
+# Fine-tune v1 dropped noise_sigma (0.2 -> 0.05) AND added lambda_div=0.5
+# and got WORSE boundary (0.7254 vs ep9's 0.6639). The likely culprit is
+# the noise reduction — the conditioning regularizer turned off, so the
+# shortcut path re-emerged. v2 isolates the change by keeping noise=0.2
+# and only adding lambda_div.
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp, vel]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+  c_lf_pt: 0
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: constant
+
+train:
+  epochs: 18                # resume.start_epoch=10, runs ep10-17 (8 epochs)
+  batch_size: 4
+  num_workers: 4            # reduced from 8 to avoid the OOM that killed v1
+  prefetch_factor: 3
+  max_train_crops: 25000
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_finetune_v2
+
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5
+  lambda_div:   0.5        # the only change vs the ep9 training regime
+  noise_sigma:  0.2        # UNCHANGED — preserve the regularizer

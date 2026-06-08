@@ -227,6 +227,13 @@ class SimulationDataset(Dataset):
         self._pt_mask = ((self._cell_idx >= self.buf) &
                          (self._cell_idx < crop_size - self.buf)
                          ).all(axis=1).astype(np.float32)
+        # Per-worker cache for the (small) stitched env and style cubes —
+        # each set has exactly one env (~192 KB) and one style (~20 B), but
+        # the un-cached path re-reads the env from disk on every __getitem__,
+        # which dominates wall-time on networked storage. With ~25 sets, the
+        # full cache fits in ~5 MB per worker.
+        self._env_cache: dict[int, np.ndarray] = {}
+        self._style_cache: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.crops)
@@ -273,15 +280,21 @@ class SimulationDataset(Dataset):
         else:
             lf_full = lf_n
 
-        env_path = os.path.join(self.st_root, f"set{sid}_quijotelike",
-                                self.snapshot, "disp.npy")
-        env_raw = self.reader.load_full(env_path)
-        env_n = self.norm.normalize(env_raw).astype(np.float32)
+        env_n = self._env_cache.get(sid)
+        if env_n is None:
+            env_path = os.path.join(self.st_root, f"set{sid}_quijotelike",
+                                    self.snapshot, "disp.npy")
+            env_raw = self.reader.load_full(env_path)
+            env_n = self.norm.normalize(env_raw).astype(np.float32)
+            self._env_cache[sid] = env_n
         env_n = self._build_env(env_n, ext_vox, (sx, sy, sz))
 
-        style_path = os.path.join(self.hf_root, f"set{sid}_pos_0_0_0",
-                                  self.snapshot, "style.npy")
-        style = self.reader.load_full(style_path).astype(np.float32)
+        style = self._style_cache.get(sid)
+        if style is None:
+            style_path = os.path.join(self.hf_root, f"set{sid}_pos_0_0_0",
+                                      self.snapshot, "style.npy")
+            style = self.reader.load_full(style_path).astype(np.float32)
+            self._style_cache[sid] = style
 
         # Optional cube-reflection augmentation (8 combinations).
         # Spatial flip on axis i ↔ negate component i of every 3-vector

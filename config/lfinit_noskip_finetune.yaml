@@ -1,0 +1,59 @@
+# Fine-tune from the best ckpt (full ep9) with three changes targeting
+# the remaining |T-1| amplitude gap (model 0.153 vs LF 0.035):
+#
+#   1. noise_sigma 0.2 -> 0.05  — the model has already learned to use
+#      conditioning, so we can sharpen predictions by dropping the
+#      regularizer that was preventing shortcut exploitation.
+#   2. lambda_div 0.0 -> 0.5    — divergence MSE directly penalises
+#      mismatched density modes (delta ≈ -∇·u), targeting power-spectrum
+#      shape rather than per-cell magnitude.
+#   3. lr 2e-4 -> 5e-5          — fine-tune step size, no cosine decay
+#      (constant LR for the short fine-tune window).
+#
+# Resume target: runs/pvfm_noskip_8137633/ckpt_epoch009.pt
+
+data:
+  root: /data/group_data/universedata/lagrangian_output_64
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp, vel]    # match ep9 architecture (c_lf = 6)
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+  c_lf_pt: 0
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: constant
+
+train:
+  epochs: 20            # resume.start_epoch=10, so this runs epochs 10-19
+  batch_size: 4
+  num_workers: 8
+  prefetch_factor: 4
+  max_train_crops: 25000    # 6250 steps/epoch; finetune doesn't need full passes
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: runs/pvfm_finetune
+
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5
+  lambda_div:   0.5
+  noise_sigma:  0.05

@@ -78,10 +78,15 @@ class Evaluator:
                  out_dir: str | Path,
                  steps: int = 1,
                  chunk_pts: int = 131072,
-                 n_bins: int = 32) -> None:
+                 n_bins: int = 32,
+                 extra_norms: dict | None = None) -> None:
         self.model = model.eval()
         self.cfg = cfg
         self.norm = norm
+        # Extra-field norms (e.g. {"vel": NormStats}) for multi-field LF
+        # voxel input. The trained model expects c_lf = 3 * len(fields)
+        # input channels; we concat extras here exactly like the dataset.
+        self.extra_norms = extra_norms or {}
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.steps = steps
@@ -97,6 +102,14 @@ class Evaluator:
         self.box_size = float(cfg["data"].get("box_size",
                                               self.D))   # for axis units
         self.env_outside_mask = cfg["data"].get("env_outside_mask", True)
+        # First field is always "disp" (target source); extras are concatenated.
+        self.fields = list(cfg["data"].get("fields", ["disp"]))
+        for f in self.fields[1:]:
+            if f not in self.extra_norms:
+                raise ValueError(
+                    f"Evaluator: missing norm stats for extra field '{f}'; "
+                    f"got extra_norms keys={list(self.extra_norms)}"
+                )
 
     # ------------------------------------------------------------------
     # full-volume inference
@@ -170,7 +183,22 @@ class Evaluator:
                     hf_full[:, sx:sx + self.D, sy:sy + self.D, sz:sz + self.D] = hf
 
                     lf_n = self.norm.normalize(lf).astype(np.float32)
-                    lf_t = torch.from_numpy(lf_n).unsqueeze(0).to(self.device)
+                    # Multi-field LF: append any extra fields (e.g. "vel")
+                    # normalized with their own stats. Concat along channel 0.
+                    if len(self.fields) > 1:
+                        extras = []
+                        for f in self.fields[1:]:
+                            extra = self.reader.load_crop(
+                                os.path.join(root, "quijotelike-64"),
+                                set_id, (sx, sy, sz),
+                                self.D, ext_vox, self.snapshot, field=f)
+                            extras.append(
+                                self.extra_norms[f].normalize(extra).astype(np.float32)
+                            )
+                        lf_n_full = np.concatenate([lf_n] + extras, axis=0)
+                    else:
+                        lf_n_full = lf_n
+                    lf_t = torch.from_numpy(lf_n_full).unsqueeze(0).to(self.device)
                     if self.env_outside_mask:
                         outside = outside_mask_for_crop(
                             env_resolution=env_n_arr.shape[-1],

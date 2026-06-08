@@ -33,7 +33,39 @@ from engine import (CheckpointManager, direct_sample, euler_sample,
                     lf_init_sample)
 from models import PVFlowMatcher
 from ops.density import disp_to_density
+from ops.geometry import overlap_crop_starts
 from ops.spectrum import coherence, power_spectrum, transfer_function
+
+
+def _axis_split_bounds(starts, D: int, L_axis: int) -> list[int]:
+    """Per-axis voxel-ownership boundaries between adjacent crops.
+
+    Given crop starts s_0 < s_1 < ... < s_{K-1} (each crop has length D),
+    returns b of length K+1 such that crop k owns voxel indices
+    [b[k], b[k+1]) along this axis. Adjacent crops split at the integer
+    midpoint of their overlap region — for uniform stride D-d, this places
+    the cut at s_k + D - d/2, matching the training-time inner cube.
+
+    Inlined from inference_distributed.axis_split_bounds to avoid pulling
+    the torch.distributed stack into a single-process eval script.
+    """
+    K = len(starts)
+    if K == 0:
+        raise ValueError("starts must be non-empty")
+    if K == 1:
+        return [0, L_axis]
+    bounds = [0]
+    for k in range(K - 1):
+        s_next = starts[k + 1]
+        e_curr = starts[k] + D
+        if s_next >= e_curr:
+            raise ValueError(
+                f"adjacent crops do not overlap: end[{k}]={e_curr} <= "
+                f"start[{k+1}]={s_next}"
+            )
+        bounds.append((s_next + e_curr) // 2)
+    bounds.append(L_axis)
+    return bounds
 
 
 def _load_model_and_norms(ckpt_path: str, device: str, use_ema: bool):
@@ -98,10 +130,25 @@ def _reconstruct_cube(ds: SimulationDataset, model, device, mode: str,
     lf_full   = np.zeros((3, Lx, Ly, Lz), dtype=np.float32)
     hf_full   = np.zeros((3, Lx, Ly, Lz), dtype=np.float32)
     pred_full = np.zeros((3, Lx, Ly, Lz), dtype=np.float32)
-    weight    = np.zeros((Lx, Ly, Lz), dtype=np.float32)
+    filled    = np.zeros((Lx, Ly, Lz), dtype=bool)
 
     D = ds.D
+    d = ds.overlap
     norm = ds.norm
+
+    # Per-axis ownership: each crop owns disjoint inner block [b[k], b[k+1])
+    # along each axis, splitting overlaps at the integer midpoint. The union
+    # of owned blocks tiles the volume exactly — no averaging, no buffer
+    # contamination. Matches inference_distributed.py and the spec.
+    starts_x = overlap_crop_starts(Lx, D, d)
+    starts_y = overlap_crop_starts(Ly, D, d)
+    starts_z = overlap_crop_starts(Lz, D, d)
+    bounds_x = _axis_split_bounds(starts_x, D, Lx)
+    bounds_y = _axis_split_bounds(starts_y, D, Ly)
+    bounds_z = _axis_split_bounds(starts_z, D, Lz)
+    sx_to_k = {sx: k for k, sx in enumerate(starts_x)}
+    sy_to_k = {sy: k for k, sy in enumerate(starts_y)}
+    sz_to_k = {sz: k for k, sz in enumerate(starts_z)}
 
     for ci in crop_indices:
         crop = ds[ci]
@@ -124,22 +171,25 @@ def _reconstruct_cube(ds: SimulationDataset, model, device, mode: str,
         pred_hf_vox = lf_vox + pred_vox_phys
 
         sx, sy, sz = ds.crops[ci][1:4]
-        # Cover the entire crop region (no inner-only mask). Overlap is
-        # handled by uniform averaging (weight += 1 per contributing crop).
-        gx0, gx1 = sx, min(sx + D, Lx)
-        gy0, gy1 = sy, min(sy + D, Ly)
-        gz0, gz1 = sz, min(sz + D, Lz)
-        lx, ly, lz = gx1 - gx0, gy1 - gy0, gz1 - gz0
-        lf_full[:, gx0:gx1, gy0:gy1, gz0:gz1]   += lf_vox[:, :lx, :ly, :lz]
-        hf_full[:, gx0:gx1, gy0:gy1, gz0:gz1]   += hf_vox[:, :lx, :ly, :lz]
-        pred_full[:, gx0:gx1, gy0:gy1, gz0:gz1] += pred_hf_vox[:, :lx, :ly, :lz]
-        weight[gx0:gx1, gy0:gy1, gz0:gz1]       += 1.0
+        kx, ky, kz = sx_to_k[sx], sy_to_k[sy], sz_to_k[sz]
+        # Owned global voxel range for this crop
+        gx0, gx1 = bounds_x[kx], bounds_x[kx + 1]
+        gy0, gy1 = bounds_y[ky], bounds_y[ky + 1]
+        gz0, gz1 = bounds_z[kz], bounds_z[kz + 1]
+        # Corresponding local slice into this crop's (D, D, D) cube
+        lx0, lx1 = gx0 - sx, gx1 - sx
+        ly0, ly1 = gy0 - sy, gy1 - sy
+        lz0, lz1 = gz0 - sz, gz1 - sz
 
-    n_unfilled = int((weight == 0).sum())
+        lf_full[:, gx0:gx1, gy0:gy1, gz0:gz1]   = lf_vox[:, lx0:lx1, ly0:ly1, lz0:lz1]
+        hf_full[:, gx0:gx1, gy0:gy1, gz0:gz1]   = hf_vox[:, lx0:lx1, ly0:ly1, lz0:lz1]
+        pred_full[:, gx0:gx1, gy0:gy1, gz0:gz1] = pred_hf_vox[:, lx0:lx1, ly0:ly1, lz0:lz1]
+        filled[gx0:gx1, gy0:gy1, gz0:gz1] = True
+
+    n_unfilled = int((~filled).sum())
     if n_unfilled:
         print(f"[physical] warning: {n_unfilled} voxels left unfilled in set {sid_filter}")
-    safe = np.maximum(weight[None], 1.0)
-    return (lf_full / safe, hf_full / safe, pred_full / safe, ext_vox)
+    return (lf_full, hf_full, pred_full, ext_vox)
 
 
 def main() -> None:

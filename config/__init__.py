@@ -36,6 +36,9 @@ class DataConfig(TypedDict, total=False):
     box_size: float               # length of the periodic box (Mpc/h or voxels)
     env_outside_mask: bool        # if True, mask env to outside-of-crop only and
                                   # append a 4th indicator channel (1=outside)
+    augment: bool                 # cube-reflection augmentation (train split)
+    norm_sample_tiles: int        # tiles sampled (one per set, strided across
+                                  # the train split) for norm stats (default 32)
 
 
 class ModelConfig(TypedDict, total=False):
@@ -47,6 +50,10 @@ class ModelConfig(TypedDict, total=False):
     env_resolution: int           # stitched LF env grid side
     c_env: int                    # env input channels (3 = disp only,
                                   # 4 = disp + outside-indicator)
+    c_lf: int                     # LF voxel input channels (3 * n_fields)
+    c_lf_pt: int                  # LF point-trunk channels (0 = no skip)
+    z_dim: int                    # latent dim for conditional stochasticity
+                                  # (0 = deterministic; used by GAN runs)
 
 
 class OptimConfig(TypedDict, total=False):
@@ -65,12 +72,38 @@ class TrainConfig(TypedDict, total=False):
     seed: int
     device: str
     out_dir: str
+    max_train_crops: int          # cap train epoch to N random crops (0 = all)
+    max_val_batches: int          # cap validation batches (0 = all)
+    spectral_monitor_batches: int # per-epoch crop-level |T-1|/r monitor
+                                  # on N val batches (0 = off)
+    prefetch_factor: int
 
 
 class FlowConfig(TypedDict, total=False):
+    mode: str                     # "flow_matching" | "lf_init" | "direct"
     n_steps_train: int            # >1 enables midpoint-sampled t for stability
     n_steps_infer: int            # 1 = single-step
     lambda_voxel: float           # weight of the voxel consistency term
+    lambda_div: float             # optional divergence (density) regularizer
+    t_alpha: float                # Beta(t_alpha, 1) bias toward small t
+    p_zero: float                 # fraction of the batch forced to t = 0
+    noise_sigma: float            # sqrt(t(1-t))-scaled noise on x_t
+
+
+class GanConfig(TypedDict, total=False):
+    enabled: bool                 # turn on conditional WGAN-GP training
+    variant: str                  # "wgan_gp" (hinge_r1 reserved as fallback)
+    d_base: int                   # critic base width
+    d_lr: float
+    d_betas: list[float]
+    n_critic: int                 # critic updates per generator update
+    gp_lambda: float              # gradient-penalty weight
+    lambda_adv_disp: float        # G weight: displacement critic
+    lambda_adv_dens: float        # G weight: density critic
+    adv_ramp_start_epoch: int     # epochs before the adv term ramps in
+    adv_ramp_epochs: int          # ramp length (linear 0 -> lambda)
+    density_eps: float            # eps in log(rho + eps)
+    d_style_proj: bool            # projection-style cosmology conditioning
 
 
 class Config(TypedDict, total=False):
@@ -79,6 +112,7 @@ class Config(TypedDict, total=False):
     optim: OptimConfig
     train: TrainConfig
     flow:  FlowConfig
+    gan:   GanConfig
 
 
 # ---------------------------------------------------------------------------

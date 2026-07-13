@@ -40,3 +40,6 @@ flow:
   n_steps_train: 1     # midpoint not yet used; single t per batch
   n_steps_infer: 1     # 1 = "single step"; raise (e.g. 4) for quality
   lambda_voxel: 0.5
+
+gan:
+  enabled: false       # conditional WGAN-GP training (see config/gan_scratch.yaml)

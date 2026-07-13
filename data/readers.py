@@ -14,12 +14,38 @@ A factory :func:`get_reader` returns the right reader for a given
 from __future__ import annotations
 
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Sequence
 
 import numpy as np
 
 TILE_SIZE_DEFAULT = 64
+
+
+def _np_load_retry(path: str, attempts: int = 4, base_delay: float = 2.0,
+                   **np_kwargs) -> np.ndarray:
+    """np.load with retry/backoff for transient NFS failures.
+
+    Long training runs read millions of small files over NFS; a single
+    transient ENOENT/ESTALE/EIO (automount blip, stale handle) otherwise
+    kills the whole job from inside a DataLoader worker — observed in
+    practice on a file that provably exists. Retries a few times with
+    escalating delay before giving up.
+    """
+    last: Exception | None = None
+    for k in range(attempts):
+        try:
+            return np.load(path, **np_kwargs)
+        except (FileNotFoundError, OSError) as e:
+            last = e
+            if k < attempts - 1:
+                delay = base_delay * (2 ** k)
+                print(f"[readers] transient load failure ({e}) on {path}; "
+                      f"retry {k + 1}/{attempts - 1} in {delay:.0f}s",
+                      flush=True)
+                time.sleep(delay)
+    raise last  # type: ignore[misc]
 
 
 class TileReader(ABC):
@@ -100,10 +126,10 @@ class NumpyTileReader(TileReader):
         ix, iy, iz = tile_xyz
         p = os.path.join(root, f"set{set_id}_pos_{ix}_{iy}_{iz}",
                          snapshot, f"{field}.npy")
-        return np.load(p, mmap_mode="r")
+        return _np_load_retry(p, mmap_mode="r")
 
     def load_full(self, path: str) -> np.ndarray:
-        return np.load(path).astype(np.float32)
+        return _np_load_retry(path).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

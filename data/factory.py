@@ -9,39 +9,62 @@ from torch.utils.data import DataLoader, RandomSampler
 
 from config import Config
 
-from .normalization import NormStats, compute_norm_stats
+from .normalization import (NormStats, compute_norm_stats,
+                            compute_residual_stats)
 from .patch_collator import PatchCollator
 from .readers import TileReader, get_reader
 from .simulation_dataset import (SNAPSHOT_DEFAULT, SimulationDataset,
                                  discover_sets, split_sets)
 
+# How many tiles to sample when estimating normalization stats
+# (override via cfg["data"]["norm_sample_tiles"]). One tile per set,
+# sets strided evenly across the (sorted) train split so the sample
+# spans the cosmology range (per-set displacement std varies ~4x with
+# sigma_8 — stats from a single set would be badly biased).
+_NORM_SAMPLE_TILES = 32
 
-def _stitched_lf_paths(root: str, sets, snapshot: str) -> list[str]:
-    return [os.path.join(root, "stitched", f"set{sid}_quijotelike",
-                         snapshot, "disp.npy")
-            for sid, _ in sets]
+
+def _sample_sets(sets, k: int):
+    """Evenly-strided subsample of ``k`` sets from the (ordered) list."""
+    if len(sets) <= k:
+        return list(sets)
+    stride = len(sets) / k
+    return [sets[int(i * stride)] for i in range(k)]
 
 
-def _quijotelike_field_paths(root: str, sets, snapshot: str,
-                             field: str) -> list[str]:
-    """Per-set tile paths for an arbitrary field (e.g. 'vel').
+def _tile_path(root: str, sub: str, sid: int, snapshot: str,
+               field: str, tile=(0, 0, 0)) -> str:
+    ix, iy, iz = tile
+    return os.path.join(root, sub, f"set{sid}_pos_{ix}_{iy}_{iz}",
+                        snapshot, f"{field}.npy")
 
-    Falls back to the (1,1,1) tile when only one is present, otherwise
-    enumerates all tiles for the set's extent so norm stats are
-    computed on a representative spatial sample.
-    """
-    paths: list[str] = []
-    for sid, ext in sets:
-        ex, ey, ez = ext
-        for ix in range(ex):
-            for iy in range(ey):
-                for iz in range(ez):
-                    paths.append(os.path.join(
-                        root, "quijotelike-64",
-                        f"set{sid}_pos_{ix}_{iy}_{iz}",
-                        snapshot, f"{field}.npy"
-                    ))
-    return paths
+
+def _lf_tile_paths(root: str, sets, snapshot: str, field: str = "disp",
+                   k: int = _NORM_SAMPLE_TILES) -> list[str]:
+    """One LF tile per set for up to ``k`` sets, strided across the split."""
+    return [_tile_path(root, "quijotelike-64", sid, snapshot, field)
+            for sid, _ in _sample_sets(sets, k)]
+
+
+def _paired_tile_paths(root: str, sets, snapshot: str,
+                       k: int = _NORM_SAMPLE_TILES
+                       ) -> list[tuple[str, str]]:
+    """(LF, HF) disp tile pairs, one per set, for residual stats."""
+    return [(_tile_path(root, "quijotelike-64", sid, snapshot, "disp"),
+             _tile_path(root, "quijote-64", sid, snapshot, "disp"))
+            for sid, _ in _sample_sets(sets, k)]
+
+
+def _compute_full_norm(root: str, train_sets, snapshot: str,
+                       k: int = _NORM_SAMPLE_TILES) -> NormStats:
+    """Input stats from LF train tiles + residual stats from LF/HF pairs."""
+    norm = compute_norm_stats(
+        _lf_tile_paths(root, train_sets, snapshot, k=k), max_files=k)
+    res_mean, res_std = compute_residual_stats(
+        _paired_tile_paths(root, train_sets, snapshot, k=k), max_files=k)
+    norm.res_mean = res_mean
+    norm.res_std = res_std
+    return norm
 
 
 def build_norm_stats(cfg: Config, reader: TileReader) -> NormStats:
@@ -49,8 +72,8 @@ def build_norm_stats(cfg: Config, reader: TileReader) -> NormStats:
     snapshot = cfg["data"].get("snapshot", SNAPSHOT_DEFAULT)
     sets = discover_sets(cfg["data"]["root"], reader, snapshot)
     splits = split_sets(sets)
-    paths = _stitched_lf_paths(cfg["data"]["root"], splits["train"], snapshot)
-    return compute_norm_stats(paths, max_files=16)
+    k = int(cfg["data"].get("norm_sample_tiles", _NORM_SAMPLE_TILES))
+    return _compute_full_norm(cfg["data"]["root"], splits["train"], snapshot, k)
 
 
 def build_datasets(cfg: Config,
@@ -72,8 +95,9 @@ def build_datasets(cfg: Config,
     splits = split_sets(sets)
 
     if norm is None:
-        train_paths = _stitched_lf_paths(cfg["data"]["root"], splits["train"], snapshot)
-        norm = compute_norm_stats(train_paths, max_files=16)
+        k = int(cfg["data"].get("norm_sample_tiles", _NORM_SAMPLE_TILES))
+        norm = _compute_full_norm(cfg["data"]["root"], splits["train"],
+                                  snapshot, k)
 
     fields = list(cfg["data"].get("fields", ["disp"]))
     if fields[0] != "disp":
@@ -81,9 +105,10 @@ def build_datasets(cfg: Config,
     if extra_norms is None:
         extra_norms = {}
         for f in fields[1:]:
-            paths = _quijotelike_field_paths(
-                cfg["data"]["root"], splits["train"], snapshot, f)
-            extra_norms[f] = compute_norm_stats(paths, max_files=16)
+            paths = _lf_tile_paths(cfg["data"]["root"], splits["train"],
+                                   snapshot, field=f)
+            extra_norms[f] = compute_norm_stats(
+                paths, max_files=_NORM_SAMPLE_TILES)
 
     aug = bool(cfg["data"].get("augment", False))
 

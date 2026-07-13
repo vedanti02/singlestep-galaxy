@@ -213,7 +213,12 @@ class Evaluator:
                     env_t = torch.from_numpy(env_crop).unsqueeze(0).to(self.device)
                     with torch.no_grad():
                         res_n = self._predict_crop(lf_t, env_t, style_t).numpy()
-                    hf_pred = self.norm.denormalize(lf_n + res_n).astype(np.float32)
+                    # LF uses the input stats; the residual its own stats
+                    # (legacy ckpts: res stats fall back to std, so this
+                    # reproduces the old denormalize(lf_n + res_n)).
+                    hf_pred = (self.norm.denormalize(lf_n)
+                               + self.norm.denormalize_residual(res_n)
+                               ).astype(np.float32)
 
                     ix0 = 0      if sx == 0       else self.buf
                     ix1 = self.D if sx + self.D >= Lx else self.D - self.buf

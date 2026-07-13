@@ -75,20 +75,7 @@ def _load_model_and_norms(ckpt_path: str, device: str, use_ema: bool):
     extra_norms = {k: NormStats.from_dict(v)
                    for k, v in (payload.get("extra_norms") or {}).items()}
 
-    m = cfg["model"]
-    default_c_env = 4 if cfg["data"].get("env_outside_mask", True) else 3
-    n_fields = len(cfg["data"].get("fields", ["disp"]))
-    model = PVFlowMatcher(
-        c_pt=3, c_lf=m.get("c_lf", 3 * n_fields),
-        c_env=m.get("c_env", default_c_env),
-        c_lf_pt=m.get("c_lf_pt", 3 * n_fields),
-        n_style=m.get("n_style", 5),
-        base_voxel=m.get("base_voxel", 32),
-        base_point=m.get("base_point", 128),
-        cond_dim=m.get("cond_dim", 256),
-        n_blocks=m.get("n_blocks", 4),
-        env_resolution=m.get("env_resolution", 64),
-    ).to(device)
+    model = PVFlowMatcher.from_config(cfg).to(device)
 
     state = (payload["ema"] if (use_ema and payload.get("ema"))
              else payload["model"])
@@ -155,8 +142,7 @@ def _reconstruct_cube(ds: SimulationDataset, model, device, mode: str,
         # Voxel-domain LF and HF cubes (denormalized)
         lf_vox = norm.denormalize(crop["lf_voxel"][:3].numpy())   # (3,D,D,D)
         tgt_vox = crop["tgt_vox"].numpy()                          # (3,D,D,D)
-        std = norm.std.reshape(3, 1, 1, 1)
-        residual_phys = tgt_vox * std
+        residual_phys = norm.denormalize_residual(tgt_vox)
         hf_vox = lf_vox + residual_phys
 
         batch = {k: (v.unsqueeze(0) if hasattr(v, "unsqueeze") else v)
@@ -167,7 +153,7 @@ def _reconstruct_cube(ds: SimulationDataset, model, device, mode: str,
         ix = ds._cell_idx[:, 0]; iy = ds._cell_idx[:, 1]; iz = ds._cell_idx[:, 2]
         for c in range(3):
             pred_vox[c, ix, iy, iz] = pred_pt[:, c]
-        pred_vox_phys = pred_vox * std
+        pred_vox_phys = norm.denormalize_residual(pred_vox)
         pred_hf_vox = lf_vox + pred_vox_phys
 
         sx, sy, sz = ds.crops[ci][1:4]

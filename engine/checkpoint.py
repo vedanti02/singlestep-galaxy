@@ -25,13 +25,18 @@ class CheckpointManager:
              cfg: dict,
              ema_state: Optional[dict] = None,
              tag: Optional[str] = None,
-             extra_norms: Optional[dict] = None) -> Path:
+             extra_norms: Optional[dict] = None,
+             disc_state: Optional[dict] = None,
+             disc_optim: Optional[dict] = None) -> Path:
         """Write a checkpoint and refresh ``ckpt_latest.pt``.
 
         Args:
             tag: If given, also writes ``ckpt_{tag}.pt`` (e.g. "epoch042").
             extra_norms: Optional ``{field: NormStats}`` for extra LF
                 input fields beyond "disp". Stored as a serializable dict.
+            disc_state: Optional ``{"d_disp": ..., "d_dens": ...}`` critic
+                state dicts (GAN runs only).
+            disc_optim: Optional critic-optimizer state dict.
         """
         payload = {
             "epoch": epoch,
@@ -42,6 +47,8 @@ class CheckpointManager:
             "cfg":   cfg,
             "extra_norms": ({k: v.to_dict() for k, v in extra_norms.items()}
                             if extra_norms else None),
+            "disc_state": disc_state,
+            "disc_optim": disc_optim,
         }
         latest = self.out_dir / "ckpt_latest.pt"
         torch.save(payload, latest)

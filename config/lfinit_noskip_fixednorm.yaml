@@ -1,0 +1,55 @@
+# Phase-1 re-baseline: identical to lfinit_noskip.yaml except for the
+# preprocessing fixes of 2026-07:
+#   - data.root points at the rebuilt tree (regenerated stitched/ env
+#     cubes; the group root's stitched/ was deleted and is unwritable).
+#   - Norm stats now come from actual LF train TILES (not the variance-
+#     suppressed stitched cubes) and the residual target is standardized
+#     by the residual's own std (unit variance, matches the flow prior).
+#     Both are automatic given the new data/normalization.py — this file
+#     just triggers a fresh stats computation via the new root.
+# This run is the corrected MSE reference row for the GAN ablation table.
+
+data:
+  root: /data/user_data/vkshirsa/lagrangian_output_64_fixed
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields: [disp, vel]
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim:   256
+  n_blocks:   4
+  n_style:    5
+  env_resolution: 64
+  c_env: 4
+  c_lf_pt: 0          # no raw-LF point skip (see lfinit_noskip.yaml)
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: warmup_cosine
+  warmup_steps: 1000
+
+train:
+  epochs: 20
+  batch_size: 4
+  num_workers: 8
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: /data/user_data/vkshirsa/singlestep_runs/pvfm_lfinit_fixednorm
+  spectral_monitor_batches: 8   # per-epoch crop-level |T-1| / r on val
+
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5
+  noise_sigma: 0.2

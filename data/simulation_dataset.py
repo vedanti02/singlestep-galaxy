@@ -242,7 +242,9 @@ class SimulationDataset(Dataset):
                    crop_origin: tuple[int, int, int]) -> np.ndarray:
         """Apply outside-only masking + append indicator channel if enabled."""
         if not self.env_outside_mask:
-            return env_n
+            # Copy: the caller may mutate the result in place (reflection
+            # augmentation), and env_n is the shared per-set cache entry.
+            return env_n.copy()
         outside = outside_mask_for_crop(
             env_resolution=env_n.shape[-1],
             sim_extent_vox=ext_vox,
@@ -262,8 +264,11 @@ class SimulationDataset(Dataset):
         hf = self.reader.load_crop(self.hf_root, sid, (sx, sy, sz),
                                    D, ext_vox, self.snapshot, field="disp")
         lf_n = self.norm.normalize(lf).astype(np.float32)
-        hf_n = self.norm.normalize(hf).astype(np.float32)
-        residual = (hf_n - lf_n).astype(np.float32)
+        # Target = physical HF-LF residual standardized by the residual
+        # stats (unit variance, matching the N(0,1) flow prior). For
+        # legacy NormStats (no residual stats) this reduces exactly to
+        # the old (hf_n - lf_n) = (hf - lf) / std convention.
+        residual = self.norm.normalize_residual(hf - lf).astype(np.float32)
 
         # Optional additional LF input channels (e.g. velocity). Loaded
         # from the same set/crop, normalized per-field, and concatenated

@@ -44,7 +44,7 @@ from data.normalization import NormStats
 from data.readers import TileReader, get_reader
 from data.simulation_dataset import SNAPSHOT_DEFAULT, discover_sets
 from engine.checkpoint import CheckpointManager
-from engine.flow_matching import euler_sample
+from engine.flow_matching import direct_sample, euler_sample, lf_init_sample
 from models import PVFlowMatcher
 from ops.geometry import outside_mask_for_crop, overlap_crop_starts
 
@@ -226,18 +226,7 @@ def build_model_from_ckpt(payload: dict, device: torch.device,
         A ``PVFlowMatcher`` in eval mode on ``device``.
     """
     cfg = payload["cfg"]
-    m = cfg.get("model", {})
-    data_cfg = cfg.get("data", {})
-    default_c_env = 4 if data_cfg.get("env_outside_mask", True) else 3
-    model = PVFlowMatcher(
-        c_pt=3, c_lf=3, c_env=m.get("c_env", default_c_env), c_lf_pt=3,
-        n_style=m.get("n_style", 5),
-        base_voxel=m.get("base_voxel", 32),
-        base_point=m.get("base_point", 128),
-        cond_dim=m.get("cond_dim", 256),
-        n_blocks=m.get("n_blocks", 4),
-        env_resolution=m.get("env_resolution", 64),
-    )
+    model = PVFlowMatcher.from_config(cfg)
     state = payload["model"]
     if use_ema and payload.get("ema") is not None:
         state = payload["ema"]
@@ -377,34 +366,50 @@ def generate_patch(model: PVFlowMatcher, *,
                    lf_voxel_t: torch.Tensor, env_t: torch.Tensor,
                    style_t: torch.Tensor, coords_t: torch.Tensor,
                    lf_pt_t: torch.Tensor, steps: int,
-                   chunk_points: int) -> torch.Tensor:
-    """Run K-step Euler sampling over one crop, possibly chunked over points.
+                   chunk_points: int, mode: str) -> torch.Tensor:
+    """Run K-step sampling over one crop, possibly chunked over points.
+
+    The sampler is dispatched on ``mode`` (``cfg["flow"]["mode"]``) so the
+    inference path matches training: ``lf_init`` checkpoints integrate
+    from x = LF (``lf_init_sample``), ``direct`` runs a single regression
+    forward, and plain flow matching integrates from noise
+    (``euler_sample``). Previously this always used ``euler_sample``,
+    which is wrong for lf_init checkpoints.
 
     Args:
         model: The trained ``PVFlowMatcher``.
-        lf_voxel_t: ``(1, 3, L, L, L)``.
+        lf_voxel_t: ``(1, c_lf, L, L, L)``.
         env_t: ``(1, c_env, R, R, R)``.
         style_t: ``(1, n_style)``.
         coords_t: ``(1, N_own, 3)`` normalized cell-centre coords in [0, 1].
-        lf_pt_t: ``(1, N_own, 3)`` normalized LF disp at those cells.
+        lf_pt_t: ``(1, N_own, c_lf_pt)`` normalized LF fields at those cells.
         steps: Number of Euler integration steps (``cfg["flow"]["n_steps_infer"]``).
         chunk_points: Maximum points per forward (limits peak activations).
+        mode: ``cfg["flow"]["mode"]``.
 
     Returns:
-        ``(N_own, 3)`` predicted normalized residual (HF_n - LF_n).
+        ``(N_own, 3)`` predicted normalized residual.
     """
+    if mode not in ("lf_init", "direct", "flow_matching"):
+        raise ValueError(f"unknown flow mode '{mode}'")
+
+    def _sample(c, l):
+        if mode == "lf_init":
+            return lf_init_sample(model, lf_voxel_t, env_t, style_t,
+                                  c, l, steps=steps)
+        if mode == "direct":
+            return direct_sample(model, lf_voxel_t, env_t, style_t, c, l)
+        return euler_sample(model, lf_voxel_t, env_t, style_t,
+                            c, l, steps=steps)
+
     N = coords_t.shape[1]
     if chunk_points <= 0 or chunk_points >= N:
-        out = euler_sample(model, lf_voxel_t, env_t, style_t,
-                           coords_t, lf_pt_t, steps=steps)
-        return out.squeeze(0)
+        return _sample(coords_t, lf_pt_t).squeeze(0)
 
     parts: List[torch.Tensor] = []
     for s in range(0, N, chunk_points):
         e = min(s + chunk_points, N)
-        out = euler_sample(model, lf_voxel_t, env_t, style_t,
-                           coords_t[:, s:e], lf_pt_t[:, s:e], steps=steps)
-        parts.append(out.squeeze(0))
+        parts.append(_sample(coords_t[:, s:e], lf_pt_t[:, s:e]).squeeze(0))
     return torch.cat(parts, dim=0)
 
 
@@ -563,12 +568,18 @@ def main() -> None:
     payload = CheckpointManager.load(args.ckpt_path, map_location="cpu")
     cfg = payload["cfg"]
     norm = NormStats.from_dict(payload["norm"])
+    # Per-field extra norms (e.g. {"vel": NormStats}) — needed when the
+    # model was trained with multi-field LF voxel input (c_lf > 3).
+    extra_norms = {k: NormStats.from_dict(v)
+                   for k, v in (payload.get("extra_norms") or {}).items()}
+    fields = list(cfg.get("data", {}).get("fields", ["disp"]))
 
     # Resolve hyper-parameters: CLI overrides cfg defaults.
     L = args.L if args.L is not None else int(cfg["data"]["crop_size"])
     d = args.d if args.d is not None else int(cfg["data"]["crop_overlap"])
     steps = args.steps if args.steps is not None \
         else int(cfg.get("flow", {}).get("n_steps_infer", 1))
+    mode = cfg.get("flow", {}).get("mode", "flow_matching")
     box_size = args.box_size if args.box_size is not None \
         else float(cfg.get("data", {}).get("box_size", 1000.0))
     env_outside_mask = bool(cfg.get("data", {}).get("env_outside_mask", True))
@@ -678,10 +689,21 @@ def main() -> None:
         axis_inner = box["axis_inner"]
         sx, sy, sz = origin
 
-        # 1) Load + normalize the LF crop.
+        # 1) Load + normalize the LF crop. For multi-field training (e.g.
+        # fields=[disp, vel]) we append each extra field along the channel
+        # axis, normalized with its own stats — matching the dataset.
         lf = reader.load_crop(lf_root, args.set_id, origin, L, ext_vox, snapshot)
         lf_n = norm.normalize(lf).astype(np.float32)                  # (3, L, L, L)
-        lf_voxel_t = torch.from_numpy(lf_n).unsqueeze(0).to(device)   # (1, 3, L, L, L)
+        if len(fields) > 1:
+            extras = []
+            for f in fields[1:]:
+                extra = reader.load_crop(lf_root, args.set_id, origin, L,
+                                         ext_vox, snapshot, field=f)
+                extras.append(extra_norms[f].normalize(extra).astype(np.float32))
+            lf_voxel_n = np.concatenate([lf_n] + extras, axis=0)      # (c_lf, L, L, L)
+        else:
+            lf_voxel_n = lf_n
+        lf_voxel_t = torch.from_numpy(lf_voxel_n).unsqueeze(0).to(device)  # (1, c_lf, L, L, L)
 
         # 2) Build the per-crop env (outside-mask + indicator if trained that way).
         env_in = build_env_for_crop(env_n_global, env_outside_mask,
@@ -696,7 +718,11 @@ def main() -> None:
 
         coords = (cell_idx.astype(np.float32) + 0.5) / float(L)       # (N_own, 3) in [0, 1]
         ix, iy, iz = cell_idx[:, 0], cell_idx[:, 1], cell_idx[:, 2]
-        lf_pt = lf_n[:, ix, iy, iz].T.astype(np.float32)              # (N_own, 3)
+        # Gather ALL LF fields at the points (disp + extras), matching the
+        # training-time lf_pt = lf_full[...] — previously only the 3 disp
+        # channels were used, a train/inference channel mismatch for
+        # fields=[disp, vel] runs.
+        lf_pt = lf_voxel_n[:, ix, iy, iz].T.astype(np.float32)        # (N_own, c_lf)
 
         coords_t = torch.from_numpy(coords).unsqueeze(0).to(device)
         lf_pt_t = torch.from_numpy(lf_pt).unsqueeze(0).to(device)
@@ -708,15 +734,18 @@ def main() -> None:
             model,
             lf_voxel_t=lf_voxel_t, env_t=env_t, style_t=style_t,
             coords_t=coords_t, lf_pt_t=lf_pt_t,
-            steps=steps, chunk_points=chunk_points,
+            steps=steps, chunk_points=chunk_points, mode=mode,
         )                                                             # (N_own, 3) normalized
 
-        # 5) Reconstruct HF displacement in physical units.
-        hf_disp_n = lf_pt_t.squeeze(0) + pred_residual_n              # normalized
-        hf_disp_n_np = hf_disp_n.detach().cpu().numpy().astype(np.float32)
-        # NormStats stores per-channel mean/std; broadcast over points.
-        hf_disp = (hf_disp_n_np * norm.std.reshape(1, 3) + norm.mean.reshape(1, 3)
-                   ).astype(np.float32)
+        # 5) Reconstruct HF displacement in physical units: LF (input
+        # stats) + residual (residual stats). For legacy checkpoints
+        # res_std == std / res_mean == 0, reproducing the old math.
+        pred_res_np = pred_residual_n.detach().cpu().numpy().astype(np.float32)
+        lf_disp_n_np = lf_pt[:, :3]                                  # disp channels
+        lf_phys = lf_disp_n_np * norm.std.reshape(1, 3) + norm.mean.reshape(1, 3)
+        res_phys = (pred_res_np * norm.res_std.reshape(1, 3)
+                    + norm.res_mean.reshape(1, 3))
+        hf_disp = (lf_phys + res_phys).astype(np.float32)
 
         # 6) Global Lagrangian voxel index + final position (periodic-wrapped).
         q_idx_global = (cell_idx + np.array(origin, dtype=np.int64)).astype(np.int32)

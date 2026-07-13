@@ -124,3 +124,36 @@ def voxel_consistency_mse(x1_pt_hat: torch.Tensor,
     diff2 = (x1_vox_hat - tgt_vox) ** 2 * vm
     den = vm.expand_as(diff2).sum().clamp(min=1.0)
     return diff2.sum() / den
+
+
+def gradient_penalty(critic, real_in: torch.Tensor, fake_in: torch.Tensor,
+                     style: torch.Tensor | None = None) -> torch.Tensor:
+    """WGAN-GP gradient penalty on interpolates of the full critic input.
+
+    Interpolates the whole concatenated tensor (field + conditioning
+    channels). For paired conditional critics the conditioning channels
+    are identical between ``real_in`` and ``fake_in``, so they interpolate
+    to themselves and the penalty constrains the critic's Lipschitz
+    constant jointly over field and conditioning — the standard cGAN-GP
+    treatment.
+
+    Must run OUTSIDE autocast and without a GradScaler: the
+    ``create_graph=True`` double-backward and scaled gradients do not mix
+    (the trainer keeps all critic math in fp32 for this reason).
+
+    Args:
+        critic:  Callable ``(B, C, S, S, S) [, style] -> (B,)``.
+        real_in: ``(B, C, S, S, S)`` real critic input.
+        fake_in: ``(B, C, S, S, S)`` fake critic input (detached).
+        style:   Optional ``(B, style_dim)`` passed through to the critic.
+
+    Returns:
+        Scalar ``E[(||grad|| - 1)^2]``.
+    """
+    B = real_in.shape[0]
+    eps = torch.rand(B, 1, 1, 1, 1, device=real_in.device,
+                     dtype=real_in.dtype)
+    x = (eps * real_in + (1.0 - eps) * fake_in).requires_grad_(True)
+    score = critic(x, style)
+    (grad,) = torch.autograd.grad(score.sum(), x, create_graph=True)
+    return ((grad.flatten(1).norm(2, dim=1) - 1.0) ** 2).mean()

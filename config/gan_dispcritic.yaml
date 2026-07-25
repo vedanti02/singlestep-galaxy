@@ -1,0 +1,59 @@
+data:
+  root: /data/user_data/vkshirsa/lagrangian_output_64_fixed
+  snapshot: PART_009
+  crop_size: 32
+  crop_overlap: 8
+  fields:
+  - disp
+  - vel
+  reader: numpy
+  box_size: 1000.0
+  env_outside_mask: true
+  augment: true
+model:
+  base_voxel: 32
+  base_point: 128
+  cond_dim: 256
+  n_blocks: 4
+  n_style: 5
+  env_resolution: 64
+  c_env: 4
+  c_lf_pt: 0
+  z_dim: 64
+optim:
+  lr: 0.0002
+  weight_decay: 1.0e-05
+  grad_clip: 1.0
+  ema_decay: 0.999
+  lr_schedule: warmup_cosine
+  warmup_steps: 1000
+train:
+  epochs: 20
+  batch_size: 4
+  num_workers: 8
+  val_every: 1
+  ckpt_every: 1
+  seed: 0
+  device: cuda
+  out_dir: /data/user_data/vkshirsa/singlestep_runs/pvfm_gan_dispcritic
+  spectral_monitor_batches: 8
+flow:
+  mode: lf_init
+  lambda_voxel: 0.5
+  noise_sigma: 0.2
+gan:
+  enabled: true
+  variant: wgan_gp
+  d_base: 64
+  d_lr: 0.0001
+  d_betas:
+  - 0.0
+  - 0.9
+  n_critic: 1
+  gp_lambda: 10.0
+  lambda_adv_disp: 0.005
+  lambda_adv_dens: 0.0
+  adv_ramp_start_epoch: 1
+  adv_ramp_epochs: 2
+  density_eps: 1.0e-06
+  d_style_proj: false

@@ -34,7 +34,8 @@ from engine import (CheckpointManager, direct_sample, euler_sample,
 from models import PVFlowMatcher
 from ops.density import disp_to_density
 from ops.geometry import overlap_crop_starts
-from ops.spectrum import coherence, power_spectrum, transfer_function
+from ops.spectrum import (amplitude_match, coherence, power_spectrum,
+                          rescale_by_curve, transfer_function)
 
 
 def _axis_split_bounds(starts, D: int, L_axis: int) -> list[int]:
@@ -69,7 +70,10 @@ def _axis_split_bounds(starts, D: int, L_axis: int) -> list[int]:
 
 
 def _load_model_and_norms(ckpt_path: str, device: str, use_ema: bool):
-    payload = CheckpointManager.load(ckpt_path, map_location=device)
+    # Load on CPU then move the model to the device. Deserializing tensors
+    # straight onto CUDA (map_location=device) can raise "CUDA device busy/
+    # unavailable" on a contended node; loading on CPU avoids that path.
+    payload = CheckpointManager.load(ckpt_path, map_location="cpu")
     cfg = payload["cfg"]
     norm = NormStats.from_dict(payload["norm"])
     extra_norms = {k: NormStats.from_dict(v)
@@ -189,10 +193,48 @@ def main() -> None:
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--n_kbins", type=int, default=24)
+    p.add_argument("--root", type=str, default=None,
+                   help="override data.root from the checkpoint cfg. Needed "
+                        "when training staged data to a node-local path "
+                        "(e.g. /scratch/...) that does not exist at eval time.")
+    p.add_argument("--spectral_correct", action="store_true",
+                   help="also report an ORACLE phase-preserving amplitude "
+                        "correction (per-shell rescale to HF power): T->1, r "
+                        "preserved. Upper bound for a spectral-amplitude method.")
+    p.add_argument("--split", type=str, default="val",
+                   choices=["train", "val", "test"],
+                   help="which split to evaluate (default val). Use 'train' "
+                        "with --dump_tk to build a deployable correction curve.")
+    p.add_argument("--dump_tk", type=str, default=None,
+                   help="save the mean model->HF transfer curve (k, T) over the "
+                        "evaluated sets to this .npz (build the deployable curve "
+                        "from the TRAIN split).")
+    p.add_argument("--correct_curve", type=str, default=None,
+                   help="apply a DEPLOYABLE (non-oracle) amplitude correction "
+                        "using a pre-measured T(k) curve .npz (from --dump_tk on "
+                        "train); reports deploy-corrected T/r. r is preserved.")
+    p.add_argument("--sids", type=str, default=None,
+                   help="comma-separated set ids to evaluate (overrides the "
+                        "first-max_sets selection). Use to match extent/box "
+                        "between the curve-building and correction sets.")
+    p.add_argument("--dump_density", type=str, default=None,
+                   help="directory to save per-set reconstructed density fields "
+                        "(rho_hf, rho_lf, rho_pred, style) for held-out "
+                        "statistics (bispectrum) and posterior P(k) summaries.")
+    p.add_argument("--dump_tk_perset", type=str, default=None,
+                   help="save per-set (sid, style, k, T) to .npz for fitting a "
+                        "cosmology-conditioned transfer emulator.")
+    p.add_argument("--correct_emulator", type=str, default=None,
+                   help="apply a DEPLOYABLE cosmology-conditioned amplitude "
+                        "correction: emulator .npz (k, coef) predicts T(k) from "
+                        "the set's 5-param cosmology; r preserved. Non-oracle.")
     args = p.parse_args()
 
     model, cfg, norm, extra_norms, epoch = _load_model_and_norms(
         args.ckpt, args.device, args.use_ema)
+    if args.root:
+        cfg["data"]["root"] = args.root
+        print(f"[physical] data.root overridden -> {args.root}")
     mode = (cfg.get("flow") or {}).get("mode", "flow_matching")
     box_size = cfg["data"].get("box_size", 1000.0)
 
@@ -202,9 +244,42 @@ def main() -> None:
     reader = get_reader(cfg["data"].get("reader", "numpy"))
     datasets, _, _ = build_datasets(cfg, reader=reader, norm=norm,
                                     extra_norms=extra_norms or None)
-    val_ds = datasets["val"]
-    sids = sorted({sid for sid, *_ in val_ds.crops})[:args.max_sets]
-    print(f"[physical] evaluating sets: {sids}")
+    val_ds = datasets[args.split]
+    all_sids = sorted({sid for sid, *_ in val_ds.crops})
+    if args.sids:
+        want = [int(s) for s in args.sids.split(",")]
+        sids = [s for s in want if s in all_sids][:args.max_sets]
+        missing = [s for s in want if s not in all_sids]
+        if missing:
+            print(f"[physical] warning: sids not in {args.split} split: {missing}")
+    else:
+        sids = all_sids[:args.max_sets]
+    print(f"[physical] evaluating split={args.split} sets: {sids}")
+
+    # Deployable correction curve (from --dump_tk on train); loaded once.
+    curve = None
+    if args.correct_curve:
+        cz = np.load(args.correct_curve)
+        curve = (cz["k"], cz["T"])
+        print(f"[physical] deployable correction from {args.correct_curve} "
+              f"({len(cz['k'])} k-bins) — NON-oracle, r-preserving")
+    emu = None
+    if args.correct_emulator:
+        ez = np.load(args.correct_emulator)
+        emu = (ez["k"], ez["coef"])   # coef: (n_bins, n_feat), feat=[1, style(5)]
+        print(f"[physical] cosmology-conditioned emulator from "
+              f"{args.correct_emulator} — NON-oracle, r-preserving")
+    tk_k_accum, tk_T_accum = [], []          # for --dump_tk (mean curve)
+    ps_sid, ps_style, ps_k, ps_T = [], [], [], []   # for --dump_tk_perset
+
+    root = cfg["data"]["root"]
+    snap = cfg["data"].get("snapshot", "PART_009")
+
+    def _load_style(sid: int) -> np.ndarray:
+        import os
+        p = os.path.join(root, "quijote-64", f"set{sid}_pos_0_0_0",
+                         snap, "style.npy")
+        return np.load(p).astype(np.float64)
 
     out_dir = Path(args.out_dir or (Path(args.ckpt).parent / "physical"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +296,18 @@ def main() -> None:
         rho_lf   = disp_to_density(lf,   box_size=box_size)
         rho_hf   = disp_to_density(hf,   box_size=box_size)
         rho_pred = disp_to_density(pred, box_size=box_size)
+
+        # Optionally save the density fields for held-out statistics
+        # (bispectrum, wavelet) and for the posterior P(k) summaries.
+        if args.dump_density:
+            ddir = Path(args.dump_density)
+            ddir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(ddir / f"set{sid}_density.npz",
+                                rho_hf=rho_hf.astype(np.float32),
+                                rho_lf=rho_lf.astype(np.float32),
+                                rho_pred=rho_pred.astype(np.float32),
+                                box_size=float(box_size), L=int(L),
+                                style=_load_style(sid))
 
         k, T_pred, P_pred, P_hf = transfer_function(
             rho_pred, rho_hf, box_size=box_size, n_bins=args.n_kbins)
@@ -250,16 +337,67 @@ def main() -> None:
         r_pred_avg = float(np.mean(r_pred[lo:hi]))
         r_lf_avg   = float(np.mean(r_lf[lo:hi]))
 
-        summary_rows.append({
+        row = {
             "set":          sid,
             "T_pred_err":   T_pred_err,
             "T_lf_err":     T_lf_err,
             "r_pred":       r_pred_avg,
             "r_lf":         r_lf_avg,
             "L":            L,
-        })
-        print(f"  set {sid}: |T-1| pred={T_pred_err:.3f}  lf={T_lf_err:.3f}   "
-              f"r pred={r_pred_avg:.3f}  lf={r_lf_avg:.3f}")
+        }
+        msg = (f"  set {sid}: |T-1| pred={T_pred_err:.3f}  lf={T_lf_err:.3f}   "
+               f"r pred={r_pred_avg:.3f}  lf={r_lf_avg:.3f}")
+
+        # Oracle phase-preserving amplitude correction (upper bound): rescale
+        # the predicted density's per-shell Fourier amplitude to match HF power.
+        # r(k) is invariant under this, T(k)->1 => isolates amplitude vs phase.
+        if args.spectral_correct:
+            rho_pred_corr = amplitude_match(rho_pred, rho_hf, box_size=box_size)
+            _, T_c, _, _ = transfer_function(rho_pred_corr, rho_hf,
+                                             box_size=box_size, n_bins=args.n_kbins)
+            _, r_c = coherence(rho_pred_corr, rho_hf, box_size=box_size,
+                               n_bins=args.n_kbins)
+            row["T_corr_err"] = float(np.mean(np.abs(T_c[lo:hi] - 1.0)))
+            row["r_corr"]     = float(np.mean(r_c[lo:hi]))
+            msg += (f"  |  ORACLE |T-1|={row['T_corr_err']:.3f} r={row['r_corr']:.3f}")
+
+        # Deployable (non-oracle) correction: rescale by a fixed T(k) curve
+        # measured on the TRAIN split — carries no info from this val cube.
+        if curve is not None:
+            rho_dep = rescale_by_curve(rho_pred, curve[0], curve[1],
+                                       box_size=box_size)
+            _, T_d, _, _ = transfer_function(rho_dep, rho_hf,
+                                             box_size=box_size, n_bins=args.n_kbins)
+            _, r_d = coherence(rho_dep, rho_hf, box_size=box_size,
+                               n_bins=args.n_kbins)
+            row["T_dep_err"] = float(np.mean(np.abs(T_d[lo:hi] - 1.0)))
+            row["r_dep"]     = float(np.mean(r_d[lo:hi]))
+            msg += (f"  |  DEPLOY |T-1|={row['T_dep_err']:.3f} r={row['r_dep']:.3f}")
+
+        # Deployable cosmology-conditioned correction: predict T(k) from the
+        # set's 5-param cosmology via the fitted emulator, then rescale.
+        if emu is not None:
+            style_vec = _load_style(sid)
+            feat = np.concatenate([[1.0], style_vec])            # (1+5,)
+            T_hat = emu[1] @ feat                                # (n_bins,)
+            rho_emu = rescale_by_curve(rho_pred, emu[0], T_hat, box_size=box_size)
+            _, T_e, _, _ = transfer_function(rho_emu, rho_hf,
+                                             box_size=box_size, n_bins=args.n_kbins)
+            _, r_e = coherence(rho_emu, rho_hf, box_size=box_size,
+                               n_bins=args.n_kbins)
+            row["T_emu_err"] = float(np.mean(np.abs(T_e[lo:hi] - 1.0)))
+            row["r_emu"]     = float(np.mean(r_e[lo:hi]))
+            msg += (f"  |  EMU |T-1|={row['T_emu_err']:.3f} r={row['r_emu']:.3f}")
+
+        if args.dump_tk is not None:
+            tk_k_accum.append(k)
+            tk_T_accum.append(T_pred)
+        if args.dump_tk_perset is not None:
+            ps_sid.append(sid); ps_style.append(_load_style(sid))
+            ps_k.append(k); ps_T.append(T_pred)
+
+        summary_rows.append(row)
+        print(msg)
 
     # Overall summary
     if summary_rows:
@@ -274,6 +412,40 @@ def main() -> None:
               f"(lower better; 0 = perfect amplitude)")
         print(f"   r     pred={r_p:.3f}        lf={r_l:.3f}        "
               f"(higher better; 1 = perfect phase)")
+        if args.spectral_correct and "T_corr_err" in summary_rows[0]:
+            T_c_avg = float(np.mean([r["T_corr_err"] for r in summary_rows]))
+            r_c_avg = float(np.mean([r["r_corr"]     for r in summary_rows]))
+            print(f"   [ORACLE amplitude-corrected] |T-1|={T_c_avg:.3f}  "
+                  f"r={r_c_avg:.3f}  (phase-preserving upper bound)")
+        if curve is not None and "T_dep_err" in summary_rows[0]:
+            T_d_avg = float(np.mean([r["T_dep_err"] for r in summary_rows]))
+            r_d_avg = float(np.mean([r["r_dep"]     for r in summary_rows]))
+            print(f"   [DEPLOY curve-corrected]    |T-1|={T_d_avg:.3f}  "
+                  f"r={r_d_avg:.3f}  (train-derived mean curve, non-oracle)")
+        if emu is not None and "T_emu_err" in summary_rows[0]:
+            T_e_avg = float(np.mean([r["T_emu_err"] for r in summary_rows]))
+            r_e_avg = float(np.mean([r["r_emu"]     for r in summary_rows]))
+            print(f"   [DEPLOY emulator-corrected] |T-1|={T_e_avg:.3f}  "
+                  f"r={r_e_avg:.3f}  (cosmology-conditioned T(k), non-oracle)")
+
+    # Save the deployable transfer curve (mean over evaluated sets).
+    if args.dump_tk is not None and tk_T_accum:
+        k_ref = tk_k_accum[0]
+        T_stack = np.stack([np.interp(k_ref, kk, TT)
+                            for kk, TT in zip(tk_k_accum, tk_T_accum)])
+        np.savez(args.dump_tk, k=k_ref, T=T_stack.mean(axis=0))
+        print(f"[physical] wrote transfer curve ({len(k_ref)} bins, "
+              f"mean over {len(tk_T_accum)} sets) -> {args.dump_tk}")
+
+    # Save per-set (style, T) for fitting a cosmology-conditioned emulator.
+    if args.dump_tk_perset is not None and ps_T:
+        k_ref = ps_k[0]
+        T_stack = np.stack([np.interp(k_ref, kk, TT)
+                            for kk, TT in zip(ps_k, ps_T)])
+        np.savez(args.dump_tk_perset, sid=np.array(ps_sid),
+                 style=np.stack(ps_style), k=k_ref, T=T_stack)
+        print(f"[physical] wrote per-set transfer data "
+              f"({len(ps_T)} sets, {len(k_ref)} bins) -> {args.dump_tk_perset}")
 
         with open(out_dir / "summary.csv", "w", newline="") as f:
             w = csv.writer(f)

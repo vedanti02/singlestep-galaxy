@@ -88,6 +88,11 @@ class FlowConfig(TypedDict, total=False):
     t_alpha: float                # Beta(t_alpha, 1) bias toward small t
     p_zero: float                 # fraction of the batch forced to t = 0
     noise_sigma: float            # sqrt(t(1-t))-scaled noise on x_t
+    lambda_pk: float              # weight of the density power-spectrum-matching
+                                  # loss (phase-preserving amplitude fix; lf_init)
+    pk_bins: int                  # radial shells for the P(k) loss (default 16)
+    pk_lo_frac: float             # keep shells in [lo, hi) * pk_bins (default 0.2)
+    pk_hi_frac: float             # (default 0.8) — matches the eval mid-k band
 
 
 class GanConfig(TypedDict, total=False):

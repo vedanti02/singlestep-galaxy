@@ -19,7 +19,7 @@ from .checkpoint import CheckpointManager
 from .ema import ModelEMA
 from .flow_matching import fm_targets, lf_init_sample
 from .losses import (divergence_mse, gradient_penalty, masked_pt_mse,
-                     voxel_consistency_mse)
+                     power_spectrum_loss, voxel_consistency_mse)
 from ops.density import cic_density
 from ops.geometry import inner_crop, points_to_voxel
 from ops.spectrum import coherence, transfer_function
@@ -165,6 +165,7 @@ class Trainer:
         B = lf_voxel.shape[0]
         mode = cfg["flow"].get("mode", "flow_matching")
         gan_pack = None
+        pk_loss = torch.zeros((), device=d)
 
         if mode == "direct":
             # Direct residual regression: model predicts tgt_pt itself.
@@ -229,13 +230,13 @@ class Trainer:
             residual_pt_hat = x1_hat - lf_disp_pt
             vox_loss = voxel_consistency_mse(residual_pt_hat, coords,
                                              tgt_vox, loss_mask)
-            if self.gan_on and train:
-                # Dedicated t=0 forward for the adversarial path: this is
-                # EXACTLY the single-step inference computation (x = LF,
-                # t = 0, v = residual), so the critics shape the
-                # distribution the paper evaluates. Reuses the cached
-                # lf_feat and g_env; only the style/time MLP is recomputed
-                # — with a fresh z sample when z_dim > 0.
+            lam_pk = cfg["flow"].get("lambda_pk", 0.0)
+            if (self.gan_on or lam_pk > 0) and train:
+                # Dedicated t=0 forward: this is EXACTLY the single-step
+                # inference computation (x = LF, t = 0, v = residual), so
+                # both the critics and the P(k) loss shape the distribution
+                # the paper evaluates. Reuses cached lf_feat and g_env; only
+                # the style/time MLP is recomputed (+ fresh z if z_dim > 0).
                 t0 = torch.zeros(B, device=d)
                 cond0 = self.model.cond_token(env, style, t0, g_env=g_env)
                 v0 = self.model(lf_disp_pt, coords, lf_pt, lf_feat, cond0)
@@ -244,13 +245,28 @@ class Trainer:
                 # so (B, D^3, 3) -> (B, 3, D, D, D) is a lossless reshape.
                 fake_res_cube = (v0.reshape(B, D_, D_, D_, 3)
                                  .permute(0, 4, 1, 2, 3))
-                gan_pack = {
-                    "fake_res_cube": fake_res_cube,
-                    "tgt_vox": tgt_vox,
-                    "lf_disp_cube": lf_voxel[:, :3],
-                    "style": style,
-                    "extent": batch["extent"],
-                }
+                if self.gan_on:
+                    gan_pack = {
+                        "fake_res_cube": fake_res_cube,
+                        "tgt_vox": tgt_vox,
+                        "lf_disp_cube": lf_voxel[:, :3],
+                        "style": style,
+                        "extent": batch["extent"],
+                    }
+                if lam_pk > 0:
+                    # Phase-preserving amplitude fix: match predicted HF
+                    # density P(k) to the true HF density P(k) (mid-k shells).
+                    # fp32 (FFT/CIC); grad flows into v0 -> generator.
+                    with torch.cuda.amp.autocast(enabled=False):
+                        rho_p = self._hf_density(fake_res_cube, lf_voxel[:, :3],
+                                                 batch["extent"])[:, 0]
+                        rho_t = self._hf_density(tgt_vox, lf_voxel[:, :3],
+                                                 batch["extent"])[:, 0].detach()
+                        pk_loss = power_spectrum_loss(
+                            rho_p, rho_t,
+                            n_bins=int(cfg["flow"].get("pk_bins", 16)),
+                            lo_frac=cfg["flow"].get("pk_lo_frac", 0.2),
+                            hi_frac=cfg["flow"].get("pk_hi_frac", 0.8))
         else:
             t = torch.rand(B, device=d)
             x_t, v_target = fm_targets(tgt_pt, t)
@@ -286,12 +302,35 @@ class Trainer:
             pred_vox = points_to_voxel(coords, pred_pt, R=D_, reduction="mean")
             div_loss = divergence_mse(pred_vox, tgt_vox, loss_mask)
 
-        loss = pt_loss + lam * vox_loss + lam_div * div_loss
+        lam_pk = cfg["flow"].get("lambda_pk", 0.0)
+        loss = (pt_loss + lam * vox_loss + lam_div * div_loss
+                + lam_pk * pk_loss)
         return {"loss": loss,
                 "pt_loss": pt_loss.detach(),
                 "vox_loss": vox_loss.detach(),
                 "div_loss": div_loss.detach(),
+                "pk_loss": pk_loss.detach(),
                 "gan_pack": gan_pack}
+
+    # ------------------------------------------------------------------
+    # density reconstruction (shared by GAN critics, P(k) loss, monitor)
+    # ------------------------------------------------------------------
+
+    def _hf_density(self, res_norm: torch.Tensor, lf_norm: torch.Tensor,
+                    extent) -> torch.Tensor:
+        """Physical HF density (mean~1) from normalized residual + LF cubes.
+
+        ``HF_phys = denorm(LF) + denorm_residual(res)``, converted to voxel
+        units with the per-sample grid spacing ``dx = box / extent`` and
+        CIC-deposited. Shared so the critics, the P(k) loss, and the spectral
+        monitor all see one consistent density definition.
+        """
+        lf_phys = lf_norm.float() * self._std_t + self._mean_t
+        res_phys = res_norm.float() * self._res_std_t + self._res_mean_t
+        dx = torch.tensor([self._box_size / float(e[0]) for e in extent],
+                          device=lf_norm.device, dtype=torch.float32
+                          ).view(-1, 1, 1, 1, 1)
+        return cic_density((lf_phys + res_phys) / dx)
 
     # ------------------------------------------------------------------
     # adversarial machinery (conditional WGAN-GP, fp32 critics)
@@ -475,7 +514,8 @@ class Trainer:
         self.model.train()
         bs = self.cfg["train"]["batch_size"]
         clip = self.cfg["optim"].get("grad_clip", 1.0)
-        running = {"loss": 0.0, "pt_loss": 0.0, "vox_loss": 0.0, "n": 0}
+        running = {"loss": 0.0, "pt_loss": 0.0, "vox_loss": 0.0,
+                   "pk_loss": 0.0, "n": 0}
         gan_running: dict[str, float] = {}
         if self.gan_on:
             lam_disp, lam_dens = self._adv_lambdas(epoch)
@@ -511,6 +551,7 @@ class Trainer:
             running["loss"]    += float(losses["loss"]) * bs
             running["pt_loss"] += float(losses["pt_loss"]) * bs
             running["vox_loss"]+= float(losses["vox_loss"]) * bs
+            running["pk_loss"] += float(losses.get("pk_loss", 0.0)) * bs
             running["n"]       += bs
             for k, v in gan_logs.items():
                 gan_running[k] = gan_running.get(k, 0.0) + v * bs
@@ -520,6 +561,7 @@ class Trainer:
                        f"loss={float(losses['loss']):.4f} "
                        f"pt={float(losses['pt_loss']):.4f} "
                        f"vox={float(losses['vox_loss']):.4f} "
+                       f"pk={float(losses.get('pk_loss', 0.0)):.4f} "
                        f"|g|={float(grad_norm):.3f} "
                        f"lr={lr_now:.2e}")
                 if gan_logs:

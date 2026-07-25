@@ -157,3 +157,96 @@ def gradient_penalty(critic, real_in: torch.Tensor, fake_in: torch.Tensor,
     score = critic(x, style)
     (grad,) = torch.autograd.grad(score.sum(), x, create_graph=True)
     return ((grad.flatten(1).norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+# ---------------------------------------------------------------------------
+# Differentiable power-spectrum-matching loss (phase-preserving amplitude fix)
+# ---------------------------------------------------------------------------
+
+# Radial-shell bin index cache for the torch power spectrum. Keyed by
+# (D, n_bins, device) since it depends only on the grid, not the data.
+_PK_BIN_CACHE: dict = {}
+
+
+def _pk_bins(D: int, n_bins: int, device) -> tuple:
+    """Return (flat shell-index tensor for the rfftn grid, per-shell counts)."""
+    import math
+    key = (D, n_bins, str(device))
+    cached = _PK_BIN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    two_pi = 2.0 * math.pi
+    kx = torch.fft.fftfreq(D, d=1.0, device=device) * two_pi
+    kz = torch.fft.rfftfreq(D, d=1.0, device=device) * two_pi
+    KX, KY, KZ = torch.meshgrid(kx, kx, kz, indexing="ij")
+    K = torch.sqrt(KX ** 2 + KY ** 2 + KZ ** 2).reshape(-1)
+    edges = torch.linspace(0.0, float(K.max()), n_bins + 1, device=device)
+    digit = torch.bucketize(K, edges) - 1
+    digit = digit.clamp(0, n_bins - 1)
+    counts = torch.bincount(digit, minlength=n_bins).clamp(min=1).float()
+    _PK_BIN_CACHE[key] = (digit, counts)
+    return digit, counts
+
+
+def radial_power_torch(field: torch.Tensor, n_bins: int) -> torch.Tensor:
+    """Differentiable isotropic power spectrum ``P(k)`` binned to ``n_bins`` shells.
+
+    Args:
+        field: ``(B, D, D, D)`` real scalar field.
+        n_bins: number of radial ``|k|`` shells.
+
+    Returns:
+        ``(B, n_bins)`` shell-averaged power (arbitrary constant factor — it
+        cancels in the log-ratio loss below).
+    """
+    B, D = field.shape[0], field.shape[-1]
+    fk = torch.fft.rfftn(field, dim=(1, 2, 3))
+    p3d = (fk.real ** 2 + fk.imag ** 2).reshape(B, -1)          # (B, Nk)
+    digit, counts = _pk_bins(D, n_bins, field.device)
+    idx = digit.unsqueeze(0).expand(B, -1)
+    P = field.new_zeros(B, n_bins)
+    P.scatter_add_(1, idx, p3d)
+    return P / counts.unsqueeze(0)
+
+
+def power_spectrum_loss(rho_pred: torch.Tensor, rho_true: torch.Tensor,
+                        n_bins: int = 16, lo_frac: float = 0.2,
+                        hi_frac: float = 0.8, eps: float = 1e-8
+                        ) -> torch.Tensor:
+    """Log-power matching loss over mid-``k`` shells (amplitude only).
+
+    Penalises ``(log P_pred(k) - log P_true(k))^2`` per shell — it constrains
+    only the per-shell Fourier *magnitude* (power), not the phases. Fields are
+    mean-subtracted (density contrast) so the DC mode is ignored.
+
+    ⚠️ METHODOLOGICAL CAVEAT — off by default (``flow.lambda_pk = 0``). Training
+    with this term optimizes the same quantity the evaluation reports
+    (``T(k)=sqrt(P_pred/P_HF)``), so a resulting ``|T-1|`` improvement is
+    partly circular ("teaching to the test"). Worse, unlike the *post-hoc*
+    correction ``ops.spectrum.amplitude_match`` (which is ``r(k)``-invariant BY
+    CONSTRUCTION), this loss only fixes per-shell magnitude — the network may
+    hit the target power by adding *decorrelated* structure, hurting coherence
+    ``r(k)`` (the perception-distortion failure mode). The recommended,
+    unbiased path is: train with MSE only (does not optimize the spectral
+    metric), then apply the phase-preserving amplitude correction post-hoc with
+    ``T(k)`` predicted from cosmology (physics, not fit to the eval set). This
+    loss is kept only as an optional, clearly-caveated tool.
+
+    Args:
+        rho_pred: ``(B, D, D, D)`` predicted density (grad flows here).
+        rho_true: ``(B, D, D, D)`` target density (detached inside).
+        n_bins: radial shells.
+        lo_frac/hi_frac: keep shells in ``[lo_frac, hi_frac) * n_bins`` (drop the
+            noisy lowest-k and the Nyquist edge, matching the eval band).
+
+    Returns:
+        Scalar loss.
+    """
+    dp = rho_pred - rho_pred.mean(dim=(1, 2, 3), keepdim=True)
+    dt = rho_true - rho_true.mean(dim=(1, 2, 3), keepdim=True)
+    Pp = radial_power_torch(dp, n_bins)
+    Pt = radial_power_torch(dt, n_bins).detach()
+    lo = max(1, int(n_bins * lo_frac))
+    hi = max(lo + 1, int(n_bins * hi_frac))
+    diff = torch.log(Pp[:, lo:hi] + eps) - torch.log(Pt[:, lo:hi] + eps)
+    return (diff ** 2).mean()
